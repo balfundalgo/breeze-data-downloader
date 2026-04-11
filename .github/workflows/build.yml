@@ -1,0 +1,83 @@
+name: Build Windows EXE
+
+# ─── Triggers ──────────────────────────────────────────────────────────────────
+# • Push a version tag  (git tag v1.2 && git push origin v1.2)
+#   → builds EXE and publishes a GitHub Release with the EXE attached
+# • Manual run via GitHub Actions UI  (workflow_dispatch)
+#   → builds EXE and uploads as a build artifact (no release)
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build on Windows
+    runs-on: windows-latest
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python ────────────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # ── 3. Dependencies ──────────────────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      # ── 4. Build EXE ─────────────────────────────────────────────────────────
+      - name: Build with PyInstaller
+        run: pyinstaller breeze_downloader.spec
+
+      # ── 5. Rename with version ───────────────────────────────────────────────
+      - name: Rename EXE with version tag
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME:-dev}"
+          mv dist/BreezeDownloader.exe "dist/BreezeDownloader_${VERSION}.exe"
+          echo "EXE_NAME=BreezeDownloader_${VERSION}.exe" >> $GITHUB_ENV
+
+      # ── 6. Upload build artifact ─────────────────────────────────────────────
+      - name: Upload EXE as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BreezeDownloader-${{ github.ref_name || 'dev' }}
+          path: dist/${{ env.EXE_NAME }}
+          retention-days: 30
+
+      # ── 7. Create GitHub Release (tag pushes only) ───────────────────────────
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Breeze Downloader ${{ github.ref_name }}"
+          body: |
+            ## Balfund · Breeze Data Downloader ${{ github.ref_name }}
+
+            ### What's included
+            - NIFTY / BANKNIFTY options historical data downloader
+            - Supports **1-minute** and **1-second** intervals
+            - Multi-threaded with resume support
+            - Dark-themed GUI — no Python installation required
+
+            ### Usage
+            1. Download `${{ env.EXE_NAME }}` below
+            2. Run it — no installation needed
+            3. Enter your ICICI Breeze credentials on the Auth tab
+            4. Configure the date range and timeframe on the Config tab
+            5. Click **Start Download**
+
+            > ⚠️ Session Token must be refreshed daily. Use the **Open Login URL** button.
+          files: dist/${{ env.EXE_NAME }}
+          draft: false
+          prerelease: false

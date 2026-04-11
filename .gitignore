@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+dist/
+build/
+*.spec.bak
+breeze_downloader_config.json
+breeze_data/
+orb_backtest_data*/
+.progress.json
+.strikes_cache.json
