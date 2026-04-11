@@ -16,17 +16,28 @@ block_cipher = None
 # Collect all customtkinter assets (themes, images)
 ctk_datas = collect_data_files("customtkinter")
 
+# Collect all breeze_connect submodules to avoid missing 'config' etc.
+breeze_hidden = collect_submodules("breeze_connect")
+
 a = Analysis(
     ["main.py"],
     pathex=["."],
     binaries=[],
     datas=ctk_datas,
     hiddenimports=[
-        # breeze_connect may import these lazily
+        # breeze_connect internals
         "breeze_connect",
+        "breeze_connect.breeze_connect",
+        "config",
         "socketio",
-        "websocket",
+        "socketio.client",
+        "socketio.exceptions",
         "engineio",
+        "engineio.client",
+        "websocket",
+        "websocket._http",
+        "websocket._socket",
+        "websocket._ssl_compat",
         # pandas internals
         "pandas._libs.tslibs.np_datetime",
         "pandas._libs.tslibs.nattype",
@@ -38,7 +49,7 @@ a = Analysis(
         "core.downloader",
         "gui",
         "gui.app",
-    ],
+    ] + breeze_hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
