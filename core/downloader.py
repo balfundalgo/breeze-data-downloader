@@ -417,7 +417,7 @@ class BreezeDownloader:
         self, d: date, expiry: date, strike: int, right: str,
         out_dir: str, progress: ProgressTracker,
     ) -> dict:
-        key = (d.isoformat(), str(strike), right)
+        key = (d.isoformat(), str(strike), right, "1minute")
         if progress.is_done(key):
             return {"skipped": 1, "files": 0, "rows": 0}
 
@@ -465,7 +465,7 @@ class BreezeDownloader:
         self, d: date, expiry: date, strike: int, right: str,
         out_dir: str, progress: ProgressTracker,
     ) -> dict:
-        key = (d.isoformat(), str(strike), right)
+        key = (d.isoformat(), str(strike), right, "1second")
         if progress.is_done(key):
             return {"skipped": 1, "files": 0, "rows": 0}
 
