@@ -801,18 +801,33 @@ class BreezeDownloaderApp(ctk.CTk):
 
     def _refresh_stock_list(self):
         """Re-render the stock results list based on current search query."""
-        for b in self._stock_btns:
-            b.destroy()
+        # Destroy ALL children of the scrollable frame — not just tracked ones.
+        # This fixes the "Loading…" label staying behind and blocking results.
+        try:
+            # CTkScrollableFrame keeps user widgets in _scrollable_frame
+            inner = getattr(self._stock_results_frame, "_scrollable_frame",
+                            self._stock_results_frame)
+            for w in inner.winfo_children():
+                w.destroy()
+        except Exception:
+            # Fallback: destroy tracked buttons only
+            for b in self._stock_btns:
+                try:
+                    b.destroy()
+                except Exception:
+                    pass
         self._stock_btns.clear()
 
         q = self.var_stock_search.get().strip().upper()
 
         if not self._stock_list:
-            ctk.CTkLabel(
+            lbl = ctk.CTkLabel(
                 self._stock_results_frame,
-                text="Loading…", font=ctk.CTkFont(size=11),
+                text="Loading stocks…", font=ctk.CTkFont(size=11),
                 text_color=C_DIM,
-            ).grid(row=0, column=0, padx=8, pady=8)
+            )
+            lbl.grid(row=0, column=0, padx=8, pady=8)
+            self._stock_btns.append(lbl)   # track it so next refresh clears it
             return
 
         if not q:
@@ -851,6 +866,21 @@ class BreezeDownloaderApp(ctk.CTk):
             )
             b.grid(row=i, column=0, sticky="ew", pady=1, padx=2)
             self._stock_btns.append(b)
+
+        if not results and q:
+            lbl = ctk.CTkLabel(
+                self._stock_results_frame,
+                text=f'No results for "{q}"',
+                font=ctk.CTkFont(size=11), text_color=C_DIM,
+            )
+            lbl.grid(row=0, column=0, padx=8, pady=12)
+            self._stock_btns.append(lbl)
+
+        # Update count in the selected label if nothing selected yet
+        if not self.var_stock_code.get():
+            count = len(results)
+            hint = f"showing {count}" if q else f"{len(self._stock_list):,} stocks — type to filter"
+            self._lbl_selected.configure(text=hint, text_color=C_DIM)
 
     def _select_stock(self, code: str, name: str):
         self.var_stock_code.set(code)
