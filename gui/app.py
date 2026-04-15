@@ -58,6 +58,8 @@ class BreezeDownloaderApp(ctk.CTk):
         self._build_ui()
         self._populate_fields()
         self._poll_log()
+        # Pre-load stock list in background so search is ready immediately
+        threading.Thread(target=self._load_stock_list, daemon=True).start()
 
     # ── Config persistence ────────────────────────────────────────────────────
 
@@ -590,134 +592,154 @@ class BreezeDownloaderApp(ctk.CTk):
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _build_stocks_tab(self, parent):
-        parent.grid_columnconfigure(0, weight=1)
-        parent.grid_rowconfigure(3, weight=1)
+        """
+        Two-panel layout:
+          Left  (300px) — live-search stock list
+          Right (flex)  — all config, stats, buttons, log
+        """
+        parent.grid_columnconfigure(0, weight=0)   # left panel fixed
+        parent.grid_columnconfigure(1, weight=1)   # right panel expands
+        parent.grid_rowconfigure(0, weight=1)
 
-        # ── Top config panel ──────────────────────────────────
-        cfg_frame = ctk.CTkFrame(parent, fg_color="#111827", corner_radius=8)
-        cfg_frame.grid(row=0, column=0, padx=8, pady=(8, 4), sticky="ew")
-        cfg_frame.grid_columnconfigure((1, 3), weight=1)
+        # ── Variables ─────────────────────────────────────────
+        self.var_stock_code     = ctk.StringVar()
+        self.var_stock_search   = ctk.StringVar()
+        self.var_stock_interval = ctk.StringVar(value="1minute")
+        self.var_stock_from     = ctk.StringVar(value="2024-01-01")
+        self.var_stock_to       = ctk.StringVar(value=date.today().isoformat())
+        self.var_stock_out_dir  = ctk.StringVar(value="breeze_data/stocks")
+        self.var_stock_spot     = ctk.BooleanVar(value=True)
+        self.var_stock_futures  = ctk.BooleanVar(value=False)
+        self.var_stock_options  = ctk.BooleanVar(value=False)
+        self.var_stock_workers  = ctk.DoubleVar(value=20)
+        self.var_stock_cpm      = ctk.DoubleVar(value=90)
+        self.var_stock_chunk    = ctk.DoubleVar(value=15)
+        self._stock_list        = []
+        self._stock_btns        = []
 
-        self.var_stock_code      = ctk.StringVar()
-        self.var_stock_interval  = ctk.StringVar(value="1minute")
-        self.var_stock_from      = ctk.StringVar(value="2024-01-01")
-        self.var_stock_to        = ctk.StringVar(value=date.today().isoformat())
-        self.var_stock_out_dir   = ctk.StringVar(value="breeze_data/stocks")
-        self.var_stock_spot      = ctk.BooleanVar(value=True)
-        self.var_stock_futures   = ctk.BooleanVar(value=False)
-        self.var_stock_options   = ctk.BooleanVar(value=False)
-        self.var_stock_workers   = ctk.DoubleVar(value=20)
-        self.var_stock_cpm       = ctk.DoubleVar(value=90)
-        self.var_stock_chunk     = ctk.DoubleVar(value=15)
-        self._stock_list         = []  # loaded from security master
+        # ═══════════════════════════════════════════════════════
+        # LEFT PANEL — stock search
+        # ═══════════════════════════════════════════════════════
+        left = ctk.CTkFrame(parent, fg_color="#111827", corner_radius=8, width=290)
+        left.grid(row=0, column=0, padx=(8, 4), pady=8, sticky="nsew")
+        left.grid_propagate(False)
+        left.grid_columnconfigure(0, weight=1)
+        left.grid_rowconfigure(2, weight=1)
 
-        def lbl(text, row, col):
-            ctk.CTkLabel(
-                cfg_frame, text=text,
-                font=ctk.CTkFont(size=12, weight="bold"), anchor="w"
-            ).grid(row=row, column=col, padx=(14, 6), pady=(10, 4), sticky="w")
+        ctk.CTkLabel(
+            left, text="🔍  Select Stock",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=C_ACCENT,
+        ).grid(row=0, column=0, padx=12, pady=(12, 6), sticky="w")
 
-        # Row 0: Stock code + load button
-        lbl("Stock Code", 0, 0)
-        sc_frame = ctk.CTkFrame(cfg_frame, fg_color="transparent")
-        sc_frame.grid(row=0, column=1, padx=(0, 8), pady=(10, 4), sticky="ew")
-
-        self._stock_entry = ctk.CTkEntry(
-            sc_frame, textvariable=self.var_stock_code,
-            width=140, placeholder_text="e.g. RELIND",
-            font=ctk.CTkFont(size=13),
+        # Search entry
+        self._stock_search_entry = ctk.CTkEntry(
+            left, textvariable=self.var_stock_search,
+            placeholder_text="Type name or code…",
+            font=ctk.CTkFont(size=12), height=34,
         )
-        self._stock_entry.pack(side="left", padx=(0, 6))
+        self._stock_search_entry.grid(row=1, column=0, padx=10, pady=(0, 6), sticky="ew")
 
-        ctk.CTkButton(
-            sc_frame, text="🔍 Search", width=90,
-            command=self._open_stock_search,
-        ).pack(side="left", padx=(0, 6))
+        # Live results list
+        self._stock_results_frame = ctk.CTkScrollableFrame(
+            left, fg_color="#0d1117", corner_radius=6,
+            scrollbar_button_color="#1e293b",
+        )
+        self._stock_results_frame.grid(row=2, column=0, padx=10, pady=(0, 6), sticky="nsew")
+        self._stock_results_frame.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkButton(
-            sc_frame, text="📥 Load Stocks", width=110,
-            command=self._load_stock_list,
-        ).pack(side="left")
+        # Selected stock display
+        self._lbl_selected = ctk.CTkLabel(
+            left, text="No stock selected",
+            font=ctk.CTkFont(size=11), text_color=C_DIM,
+            wraplength=260, justify="left",
+        )
+        self._lbl_selected.grid(row=3, column=0, padx=12, pady=(4, 12), sticky="w")
 
-        # Row 0 col 2-3: Interval
-        lbl("Interval", 0, 2)
+        # Wire up live search
+        self.var_stock_search.trace_add("write", lambda *_: self._refresh_stock_list())
+
+        # ═══════════════════════════════════════════════════════
+        # RIGHT PANEL — config + stats + log
+        # ═══════════════════════════════════════════════════════
+        right = ctk.CTkFrame(parent, fg_color="transparent")
+        right.grid(row=0, column=1, padx=(0, 8), pady=8, sticky="nsew")
+        right.grid_columnconfigure(0, weight=1)
+        right.grid_rowconfigure(3, weight=1)
+
+        # ── Config card ───────────────────────────────────────
+        cfg = ctk.CTkFrame(right, fg_color="#111827", corner_radius=8)
+        cfg.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        cfg.grid_columnconfigure(1, weight=1)
+
+        def lbl(text, row):
+            ctk.CTkLabel(cfg, text=text,
+                          font=ctk.CTkFont(size=12, weight="bold"), anchor="w"
+                          ).grid(row=row, column=0, padx=(14, 8), pady=(10, 4), sticky="w")
+
+        # Interval
+        lbl("Interval", 0)
         ctk.CTkSegmentedButton(
-            cfg_frame,
+            cfg,
             values=["1second", "1minute", "5minute", "30minute", "1day"],
             variable=self.var_stock_interval,
-            width=380,
-        ).grid(row=0, column=3, padx=(0, 14), pady=(10, 4), sticky="w")
+        ).grid(row=0, column=1, padx=(0, 14), pady=(10, 4), sticky="ew")
 
-        # Row 1: From date / To date
-        lbl("From Date", 1, 0)
-        ctk.CTkEntry(
-            cfg_frame, textvariable=self.var_stock_from,
-            width=140, placeholder_text="YYYY-MM-DD",
-        ).grid(row=1, column=1, padx=(0, 8), pady=(6, 4), sticky="w")
+        # From date
+        lbl("From Date", 1)
+        ctk.CTkEntry(cfg, textvariable=self.var_stock_from,
+                      width=160, placeholder_text="YYYY-MM-DD",
+                      ).grid(row=1, column=1, padx=(0, 14), pady=(6, 4), sticky="w")
 
-        lbl("To Date", 1, 2)
-        ctk.CTkEntry(
-            cfg_frame, textvariable=self.var_stock_to,
-            width=140, placeholder_text="YYYY-MM-DD",
-        ).grid(row=1, column=3, padx=(0, 14), pady=(6, 4), sticky="w")
+        # To date
+        lbl("To Date", 2)
+        ctk.CTkEntry(cfg, textvariable=self.var_stock_to,
+                      width=160, placeholder_text="YYYY-MM-DD",
+                      ).grid(row=2, column=1, padx=(0, 14), pady=(6, 4), sticky="w")
 
-        # Row 2: Output dir
-        lbl("Output Dir", 2, 0)
-        od_frame = ctk.CTkFrame(cfg_frame, fg_color="transparent")
-        od_frame.grid(row=2, column=1, columnspan=3, padx=(0, 14),
-                      pady=(6, 4), sticky="ew")
-        ctk.CTkEntry(od_frame, textvariable=self.var_stock_out_dir,
-                     width=320).pack(side="left")
-        ctk.CTkButton(od_frame, text="Browse…", width=80,
-                       command=self._stock_browse_dir).pack(side="left", padx=(8, 0))
+        # Output dir
+        lbl("Output Dir", 3)
+        od = ctk.CTkFrame(cfg, fg_color="transparent")
+        od.grid(row=3, column=1, padx=(0, 14), pady=(6, 4), sticky="ew")
+        ctk.CTkEntry(od, textvariable=self.var_stock_out_dir).pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(od, text="Browse…", width=76,
+                       command=self._stock_browse_dir).pack(side="left", padx=(6, 0))
 
-        # Row 3: Product type checkboxes
-        lbl("Products", 3, 0)
-        prod_frame = ctk.CTkFrame(cfg_frame, fg_color="transparent")
-        prod_frame.grid(row=3, column=1, columnspan=3, padx=(0, 14),
-                        pady=(6, 4), sticky="w")
+        # Products
+        lbl("Products", 4)
+        pf = ctk.CTkFrame(cfg, fg_color="transparent")
+        pf.grid(row=4, column=1, padx=(0, 14), pady=(6, 4), sticky="w")
+        ctk.CTkCheckBox(pf, text="Spot", variable=self.var_stock_spot,
+                         font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 16))
+        ctk.CTkCheckBox(pf, text="Futures (auto expiry)",
+                         variable=self.var_stock_futures,
+                         font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 16))
+        ctk.CTkCheckBox(pf, text="Options (auto expiry + all strikes)",
+                         variable=self.var_stock_options,
+                         font=ctk.CTkFont(size=12)).pack(side="left")
 
-        ctk.CTkCheckBox(
-            prod_frame, text="Spot (Cash)",
-            variable=self.var_stock_spot,
-            font=ctk.CTkFont(size=12),
-        ).pack(side="left", padx=(0, 20))
+        # Advanced sliders
+        sf = ctk.CTkFrame(cfg, fg_color="transparent")
+        sf.grid(row=5, column=0, columnspan=2, padx=14, pady=(4, 12), sticky="ew")
 
-        ctk.CTkCheckBox(
-            prod_frame, text="Futures  (auto expiry)",
-            variable=self.var_stock_futures,
-            font=ctk.CTkFont(size=12),
-        ).pack(side="left", padx=(0, 20))
-
-        ctk.CTkCheckBox(
-            prod_frame, text="Options  (auto expiry + all strikes)",
-            variable=self.var_stock_options,
-            font=ctk.CTkFont(size=12),
-        ).pack(side="left")
-
-        # Row 4: Advanced sliders
-        adv_frame = ctk.CTkFrame(cfg_frame, fg_color="transparent")
-        adv_frame.grid(row=4, column=0, columnspan=4, padx=14,
-                       pady=(4, 12), sticky="ew")
-
-        def mini_slider(parent, label, var, from_, to, steps):
+        def mini_slider(parent, label, var, lo, hi, steps):
             f = ctk.CTkFrame(parent, fg_color="transparent")
-            ctk.CTkLabel(f, text=label, font=ctk.CTkFont(size=11),
+            ctk.CTkLabel(f, text=label, font=ctk.CTkFont(size=10),
                           text_color=C_DIM).pack(anchor="w")
-            row = ctk.CTkFrame(f, fg_color="transparent")
-            row.pack(fill="x")
-            ctk.CTkSlider(row, from_=from_, to=to, variable=var,
-                           number_of_steps=steps, width=160).pack(side="left")
-            ctk.CTkLabel(row, textvariable=var, width=44,
-                          font=ctk.CTkFont(size=11)).pack(side="left", padx=(6,0))
+            r = ctk.CTkFrame(f, fg_color="transparent")
+            r.pack(fill="x")
+            ctk.CTkSlider(r, from_=lo, to=hi, variable=var,
+                           number_of_steps=steps, width=150).pack(side="left")
+            ctk.CTkLabel(r, textvariable=var, width=42,
+                          font=ctk.CTkFont(size=10)).pack(side="left", padx=(5, 0))
             return f
 
-        mini_slider(adv_frame, "Workers", self.var_stock_workers,
-                    1, 50, 49).pack(side="left", padx=(0, 24))
-        mini_slider(adv_frame, "API Calls/Min", self.var_stock_cpm,
-                    10, 200, 190).pack(side="left", padx=(0, 24))
-        mini_slider(adv_frame, "Chunk Min (1sec)", self.var_stock_chunk,
-                    5, 60, 11).pack(side="left")
+        mini_slider(sf, "Workers", self.var_stock_workers, 1, 50, 49
+                    ).pack(side="left", padx=(0, 20))
+        mini_slider(sf, "API Calls/Min", self.var_stock_cpm, 10, 200, 190
+                    ).pack(side="left", padx=(0, 20))
+        mini_slider(sf, "Chunk Min (1sec)", self.var_stock_chunk, 5, 60, 11
+                    ).pack(side="left")
 
         # ── Stats strip ───────────────────────────────────────
         self._stock_stat_vars = {
@@ -726,142 +748,122 @@ class BreezeDownloaderApp(ctk.CTk):
             "rows":      ctk.StringVar(value="0"),
             "api_calls": ctk.StringVar(value="0"),
         }
-
-        stats_frame = ctk.CTkFrame(parent, fg_color=C_BG_STATS,
-                                    corner_radius=8, height=64)
-        stats_frame.grid(row=1, column=0, padx=8, pady=4, sticky="ew")
-        stats_frame.grid_propagate(False)
-        stats_frame.grid_columnconfigure((0,1,2,3), weight=1)
-
+        sf2 = ctk.CTkFrame(right, fg_color=C_BG_STATS, corner_radius=8, height=58)
+        sf2.grid(row=1, column=0, sticky="ew", pady=(0, 4))
+        sf2.grid_propagate(False)
+        sf2.grid_columnconfigure((0,1,2,3), weight=1)
         for col, (label, key) in enumerate([
-            ("📅 Days", "days"), ("💾 Files", "files"),
-            ("📊 Rows", "rows"), ("🔌 API Calls", "api_calls"),
+            ("📅 Days","days"),("💾 Files","files"),
+            ("📊 Rows","rows"),("🔌 API","api_calls"),
         ]):
-            f = ctk.CTkFrame(stats_frame, fg_color="transparent")
-            f.grid(row=0, column=col, padx=6, pady=6)
-            ctk.CTkLabel(f, text=label, font=ctk.CTkFont(size=10),
+            f = ctk.CTkFrame(sf2, fg_color="transparent")
+            f.grid(row=0, column=col, padx=4, pady=4)
+            ctk.CTkLabel(f, text=label, font=ctk.CTkFont(size=9),
                           text_color=C_DIM).pack()
             ctk.CTkLabel(f, textvariable=self._stock_stat_vars[key],
-                          font=ctk.CTkFont(size=18, weight="bold"),
+                          font=ctk.CTkFont(size=16, weight="bold"),
                           text_color=C_ACCENT).pack()
 
-        # ── Button row ────────────────────────────────────────
-        bf = ctk.CTkFrame(parent, fg_color="transparent")
-        bf.grid(row=2, column=0, padx=8, pady=4, sticky="ew")
+        # ── Buttons ───────────────────────────────────────────
+        bf = ctk.CTkFrame(right, fg_color="transparent")
+        bf.grid(row=2, column=0, sticky="ew", pady=(0, 4))
 
         self._btn_stock_start = ctk.CTkButton(
-            bf, text="▶  Start Download", width=180, height=42,
+            bf, text="▶  Start Download", width=170, height=40,
             fg_color=C_BTN_GREEN, hover_color=C_BTN_GHOVER,
-            font=ctk.CTkFont(size=14, weight="bold"),
+            font=ctk.CTkFont(size=13, weight="bold"),
             command=self._start_stock_download,
         )
-        self._btn_stock_start.pack(side="left", padx=(0, 8))
+        self._btn_stock_start.pack(side="left", padx=(0, 6))
 
         self._btn_stock_stop = ctk.CTkButton(
-            bf, text="⏹  Stop", width=110, height=42,
+            bf, text="⏹  Stop", width=100, height=40,
             fg_color=C_BTN_RED, hover_color=C_BTN_RHOVER,
-            font=ctk.CTkFont(size=14, weight="bold"),
+            font=ctk.CTkFont(size=13, weight="bold"),
             command=self._stop_stock_download, state="disabled",
         )
-        self._btn_stock_stop.pack(side="left", padx=(0, 8))
+        self._btn_stock_stop.pack(side="left", padx=(0, 6))
 
-        ctk.CTkButton(
-            bf, text="🗑  Clear Log", width=110, height=42,
-            command=self._clear_stock_log,
-        ).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(bf, text="🗑 Clear Log", width=100, height=40,
+                       command=self._clear_stock_log).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(bf, text="📂 Open Folder", width=110, height=40,
+                       command=self._open_stock_dir).pack(side="left")
 
-        ctk.CTkButton(
-            bf, text="📂  Open Folder", width=120, height=42,
-            command=self._open_stock_dir,
-        ).pack(side="left")
-
-        # ── Log area ──────────────────────────────────────────
+        # ── Log ───────────────────────────────────────────────
         self._stock_log_text = ctk.CTkTextbox(
-            parent,
-            font=ctk.CTkFont(family="Courier", size=11),
+            right, font=ctk.CTkFont(family="Courier", size=11),
             fg_color=C_BG_LOG, text_color="#d4d4d4",
             corner_radius=8, wrap="word",
         )
-        self._stock_log_text.grid(row=3, column=0, padx=8, pady=(4, 8),
-                                   sticky="nsew")
+        self._stock_log_text.grid(row=3, column=0, sticky="nsew")
 
-    # ── Stock search popup ────────────────────────────────────────────────────
+    # ── Live stock search ─────────────────────────────────────────────────────
 
-    def _open_stock_search(self):
-        """Open a searchable popup to pick a stock from the master list."""
+    def _refresh_stock_list(self):
+        """Re-render the stock results list based on current search query."""
+        for b in self._stock_btns:
+            b.destroy()
+        self._stock_btns.clear()
+
+        q = self.var_stock_search.get().strip().upper()
+
         if not self._stock_list:
-            messagebox.showinfo(
-                "Load Stocks First",
-                "Click 'Load Stocks' to download the NSE Security Master first."
-            )
+            ctk.CTkLabel(
+                self._stock_results_frame,
+                text="Loading…", font=ctk.CTkFont(size=11),
+                text_color=C_DIM,
+            ).grid(row=0, column=0, padx=8, pady=8)
             return
 
-        popup = ctk.CTkToplevel(self)
-        popup.title("Select Stock")
-        popup.geometry("460x520")
-        popup.grab_set()
+        if not q:
+            # Show first 60 when empty
+            results = self._stock_list[:60]
+        else:
+            # Search: code exact prefix first, then name contains
+            exact   = [(c, n) for c, n in self._stock_list if c.startswith(q)]
+            partial = [(c, n) for c, n in self._stock_list
+                       if not c.startswith(q) and (q in c or q in n)]
+            results = (exact + partial)[:80]
 
-        search_var = ctk.StringVar()
-        ctk.CTkLabel(popup, text="Search by name or code:",
-                      font=ctk.CTkFont(size=12)).pack(padx=14, pady=(14, 4), anchor="w")
-        ctk.CTkEntry(popup, textvariable=search_var, width=420,
-                      placeholder_text="e.g. RELIANCE or RELIND"
-                      ).pack(padx=14, pady=(0, 8))
+        for i, (code, name) in enumerate(results):
+            is_selected = (code == self.var_stock_code.get())
+            b = ctk.CTkButton(
+                self._stock_results_frame,
+                text=f"{code:<10} {name[:28]}",
+                font=ctk.CTkFont(family="Courier", size=11),
+                anchor="w", height=26,
+                fg_color="#1e3a5f" if is_selected else "transparent",
+                hover_color="#1e293b",
+                command=lambda c=code, n=name: self._select_stock(c, n),
+            )
+            b.grid(row=i, column=0, sticky="ew", pady=1, padx=2)
+            self._stock_btns.append(b)
 
-        listbox_frame = ctk.CTkScrollableFrame(popup, height=380)
-        listbox_frame.pack(fill="both", expand=True, padx=14, pady=(0, 14))
-        listbox_frame.grid_columnconfigure(0, weight=1)
+    def _select_stock(self, code: str, name: str):
+        self.var_stock_code.set(code)
+        self._lbl_selected.configure(
+            text=f"✅  {code}  —  {name}", text_color=C_GREEN
+        )
+        self._refresh_stock_list()  # re-render to highlight selected
 
-        buttons = []
-
-        def refresh(query=""):
-            for b in buttons:
-                b.destroy()
-            buttons.clear()
-            q = query.upper()
-            results = [
-                (code, name) for code, name in self._stock_list
-                if q in code.upper() or q in name.upper()
-            ][:80]
-            for i, (code, name) in enumerate(results):
-                b = ctk.CTkButton(
-                    listbox_frame,
-                    text=f"{code:<12}  {name[:35]}",
-                    font=ctk.CTkFont(family="Courier", size=11),
-                    anchor="w", height=28,
-                    fg_color="transparent", hover_color="#1e293b",
-                    command=lambda c=code: (
-                        self.var_stock_code.set(c),
-                        popup.destroy(),
-                    ),
-                )
-                b.grid(row=i, column=0, sticky="ew", pady=1)
-                buttons.append(b)
-
-        refresh()
-        search_var.trace_add("write", lambda *_: refresh(search_var.get()))
-
-    # ── Load stock list from Security Master ──────────────────────────────────
+        # ── Load stock list from Security Master ──────────────────────────────────
 
     def _load_stock_list(self):
-        self._stock_log("📥 Loading NSE Security Master...")
-
-        def _do():
-            try:
-                sm = get_security_master()
-                sm.load(log_fn=self._stock_log_queue.put)
-                df = sm.eq_stocks()
-                self._stock_list = list(
-                    zip(df["ShortName"].tolist(), df["CompanyName"].tolist())
-                )
-                self._stock_log_queue.put(
-                    f"✅ {len(self._stock_list)} EQ stocks loaded. "
-                    f"Click '🔍 Search' to pick a stock."
-                )
-            except Exception as e:
-                self._stock_log_queue.put(f"❌ Failed to load: {e}")
-
-        threading.Thread(target=_do, daemon=True).start()
+        try:
+            sm = get_security_master()
+            sm.load(log_fn=self._stock_log_queue.put)
+            df = sm.eq_stocks()
+            # Sort: code alphabetically
+            self._stock_list = list(
+                zip(df["ShortName"].tolist(), df["CompanyName"].tolist())
+            )
+            self._stock_log_queue.put(
+                f"✅ {len(self._stock_list)} NSE stocks loaded — type to search"
+            )
+            # Refresh the results list on the main thread
+            self.after(0, self._refresh_stock_list)
+        except Exception as e:
+            self._stock_log_queue.put(f"❌ Failed to load stocks: {e}")
 
     # ── Stock download control ────────────────────────────────────────────────
 
