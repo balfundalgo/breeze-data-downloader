@@ -133,14 +133,45 @@ class SecurityMaster:
             log_fn(f"   📊 EQ stocks: {len(self._eq_df)} | F&O rows: {len(self._fo_df)}")
 
     def eq_stocks(self) -> pd.DataFrame:
-        """Return all EQ series stocks as DataFrame with ShortName, CompanyName."""
+        """
+        Return all tradeable NSE stocks.
+        Includes EQ, BE, BZ, SM, N, DR series — not just EQ —
+        so large caps like TCS (series may vary) are always included.
+        Excludes bonds, debentures, warrants (series: GB, GS, IV, MF, etc.)
+        """
         if self._eq_df is None:
             raise RuntimeError("Call load() first")
-        df = self._eq_df
-        eq = df[df["Series"].astype(str).str.strip().str.upper() == "EQ"].copy()
-        eq = eq[eq["ShortName"].str.len() >= 2]
-        return eq[["ShortName", "CompanyName"]].drop_duplicates(
-            subset="ShortName").reset_index(drop=True)
+        df = self._eq_df.copy()
+
+        # Series that are equity/equity-like tradeable instruments
+        EQUITY_SERIES = {
+            "EQ",   # Regular equity
+            "BE",   # Trade-to-trade (Book Entry)
+            "BZ",   # Trade-to-trade (Z group)
+            "SM",   # SME
+            "ST",   # SME trade-to-trade
+            "N",    # New listing
+            "W",    # When issued
+            "IL",   # InvIT/REIT
+        }
+
+        series_col = df["Series"].astype(str).str.strip().str.upper()
+        df = df[series_col.isin(EQUITY_SERIES)].copy()
+
+        # Clean up ShortName
+        df["ShortName"]   = df["ShortName"].astype(str).str.strip().str.strip('"')
+        df["CompanyName"] = df["CompanyName"].astype(str).str.strip().str.strip('"')
+
+        # Drop obviously invalid codes
+        df = df[df["ShortName"].str.len() >= 2]
+        df = df[df["ShortName"].str.match(r'^[A-Z0-9&\-]+$', na=False)]
+
+        return (
+            df[["ShortName", "CompanyName"]]
+            .drop_duplicates(subset="ShortName")
+            .sort_values("ShortName")
+            .reset_index(drop=True)
+        )
 
     def strikes_for_expiry(self, stock_code: str, expiry: date) -> list[int]:
         """

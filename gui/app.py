@@ -819,10 +819,23 @@ class BreezeDownloaderApp(ctk.CTk):
             # Show first 60 when empty
             results = self._stock_list[:60]
         else:
-            # Search: code exact prefix first, then name contains
-            exact   = [(c, n) for c, n in self._stock_list if c.startswith(q)]
+            words = q.split()   # support "TATA CONS" → ["TATA", "CONS"]
+
+            def matches(code, name):
+                code_u = code.upper()
+                name_u = name.upper()
+                # All words must appear somewhere in code OR name
+                return all(
+                    w in code_u or w in name_u
+                    for w in words
+                )
+
+            # Exact code prefix first
+            exact   = [(c, n) for c, n in self._stock_list
+                       if c.upper().startswith(q)]
+            # Then full-word matches
             partial = [(c, n) for c, n in self._stock_list
-                       if not c.startswith(q) and (q in c or q in n)]
+                       if not c.upper().startswith(q) and matches(c, n)]
             results = (exact + partial)[:80]
 
         for i, (code, name) in enumerate(results):
