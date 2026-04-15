@@ -15,6 +15,7 @@ import urllib.parse
 from datetime import date, datetime
 
 from core.downloader import BreezeDownloader
+from core.stock_downloader import StockDownloader, get_security_master
 
 CONFIG_FILE = "breeze_downloader_config.json"
 
@@ -46,8 +47,11 @@ class BreezeDownloaderApp(ctk.CTk):
         self.minsize(820, 600)
 
         self._stop_event      = threading.Event()
+        self._stop_stock_event = threading.Event()
         self._log_queue       = queue.Queue()
+        self._stock_log_queue = queue.Queue()
         self._download_thread = None
+        self._stock_thread    = None
         self._saved_config    = self._load_config()
         self._totals          = {"days": 0, "files": 0, "rows": 0, "api_calls": 0}
 
@@ -124,7 +128,7 @@ class BreezeDownloaderApp(ctk.CTk):
 
         ctk.CTkLabel(
             hdr,
-            text="ICICI Breeze  ·  NIFTY / BANKNIFTY Options",
+            text="ICICI Breeze  ·  NIFTY / BANKNIFTY / Stocks",
             font=ctk.CTkFont(size=11),
             text_color=C_DIM,
         ).place(relx=1, rely=0.5, anchor="e", x=-14)
@@ -132,12 +136,13 @@ class BreezeDownloaderApp(ctk.CTk):
         # ── Tab view ──────────────────────────────────────────
         self.tabs = ctk.CTkTabview(self, corner_radius=8)
         self.tabs.grid(row=1, column=0, sticky="nsew", padx=10, pady=(6, 0))
-        for name in ("🔐  Auth", "⚙️  Config", "📥  Download"):
+        for name in ("🔐  Auth", "⚙️  Config", "📥  Download", "📈  Stocks"):
             self.tabs.add(name)
 
         self._build_auth_tab(self.tabs.tab("🔐  Auth"))
         self._build_config_tab(self.tabs.tab("⚙️  Config"))
         self._build_download_tab(self.tabs.tab("📥  Download"))
+        self._build_stocks_tab(self.tabs.tab("📈  Stocks"))
 
         # ── Status bar ────────────────────────────────────────
         sb = ctk.CTkFrame(self, height=26, corner_radius=0, fg_color=C_BG_HEADER)
@@ -551,6 +556,13 @@ class BreezeDownloaderApp(ctk.CTk):
                 self._log(msg)
         except Exception:
             pass
+        # Also drain stock log
+        try:
+            while True:
+                msg = self._stock_log_queue.get_nowait()
+                self._stock_log(msg)
+        except Exception:
+            pass
         self.after(100, self._poll_log)
 
     def _clear_log(self):
@@ -572,3 +584,400 @@ class BreezeDownloaderApp(ctk.CTk):
 
     def _set_status(self, text: str, color: str = "#e0e0e0"):
         self._lbl_status.configure(text=f"● {text}", text_color=color)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # STOCKS TAB
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _build_stocks_tab(self, parent):
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(3, weight=1)
+
+        # ── Top config panel ──────────────────────────────────
+        cfg_frame = ctk.CTkFrame(parent, fg_color="#111827", corner_radius=8)
+        cfg_frame.grid(row=0, column=0, padx=8, pady=(8, 4), sticky="ew")
+        cfg_frame.grid_columnconfigure((1, 3), weight=1)
+
+        self.var_stock_code      = ctk.StringVar()
+        self.var_stock_interval  = ctk.StringVar(value="1minute")
+        self.var_stock_from      = ctk.StringVar(value="2024-01-01")
+        self.var_stock_to        = ctk.StringVar(value=date.today().isoformat())
+        self.var_stock_out_dir   = ctk.StringVar(value="breeze_data/stocks")
+        self.var_stock_spot      = ctk.BooleanVar(value=True)
+        self.var_stock_futures   = ctk.BooleanVar(value=False)
+        self.var_stock_options   = ctk.BooleanVar(value=False)
+        self.var_stock_workers   = ctk.DoubleVar(value=20)
+        self.var_stock_cpm       = ctk.DoubleVar(value=90)
+        self.var_stock_chunk     = ctk.DoubleVar(value=15)
+        self._stock_list         = []  # loaded from security master
+
+        def lbl(text, row, col):
+            ctk.CTkLabel(
+                cfg_frame, text=text,
+                font=ctk.CTkFont(size=12, weight="bold"), anchor="w"
+            ).grid(row=row, column=col, padx=(14, 6), pady=(10, 4), sticky="w")
+
+        # Row 0: Stock code + load button
+        lbl("Stock Code", 0, 0)
+        sc_frame = ctk.CTkFrame(cfg_frame, fg_color="transparent")
+        sc_frame.grid(row=0, column=1, padx=(0, 8), pady=(10, 4), sticky="ew")
+
+        self._stock_entry = ctk.CTkEntry(
+            sc_frame, textvariable=self.var_stock_code,
+            width=140, placeholder_text="e.g. RELIND",
+            font=ctk.CTkFont(size=13),
+        )
+        self._stock_entry.pack(side="left", padx=(0, 6))
+
+        ctk.CTkButton(
+            sc_frame, text="🔍 Search", width=90,
+            command=self._open_stock_search,
+        ).pack(side="left", padx=(0, 6))
+
+        ctk.CTkButton(
+            sc_frame, text="📥 Load Stocks", width=110,
+            command=self._load_stock_list,
+        ).pack(side="left")
+
+        # Row 0 col 2-3: Interval
+        lbl("Interval", 0, 2)
+        ctk.CTkSegmentedButton(
+            cfg_frame,
+            values=["1second", "1minute", "5minute", "30minute", "1day"],
+            variable=self.var_stock_interval,
+            width=380,
+        ).grid(row=0, column=3, padx=(0, 14), pady=(10, 4), sticky="w")
+
+        # Row 1: From date / To date
+        lbl("From Date", 1, 0)
+        ctk.CTkEntry(
+            cfg_frame, textvariable=self.var_stock_from,
+            width=140, placeholder_text="YYYY-MM-DD",
+        ).grid(row=1, column=1, padx=(0, 8), pady=(6, 4), sticky="w")
+
+        lbl("To Date", 1, 2)
+        ctk.CTkEntry(
+            cfg_frame, textvariable=self.var_stock_to,
+            width=140, placeholder_text="YYYY-MM-DD",
+        ).grid(row=1, column=3, padx=(0, 14), pady=(6, 4), sticky="w")
+
+        # Row 2: Output dir
+        lbl("Output Dir", 2, 0)
+        od_frame = ctk.CTkFrame(cfg_frame, fg_color="transparent")
+        od_frame.grid(row=2, column=1, columnspan=3, padx=(0, 14),
+                      pady=(6, 4), sticky="ew")
+        ctk.CTkEntry(od_frame, textvariable=self.var_stock_out_dir,
+                     width=320).pack(side="left")
+        ctk.CTkButton(od_frame, text="Browse…", width=80,
+                       command=self._stock_browse_dir).pack(side="left", padx=(8, 0))
+
+        # Row 3: Product type checkboxes
+        lbl("Products", 3, 0)
+        prod_frame = ctk.CTkFrame(cfg_frame, fg_color="transparent")
+        prod_frame.grid(row=3, column=1, columnspan=3, padx=(0, 14),
+                        pady=(6, 4), sticky="w")
+
+        ctk.CTkCheckBox(
+            prod_frame, text="Spot (Cash)",
+            variable=self.var_stock_spot,
+            font=ctk.CTkFont(size=12),
+        ).pack(side="left", padx=(0, 20))
+
+        ctk.CTkCheckBox(
+            prod_frame, text="Futures  (auto expiry)",
+            variable=self.var_stock_futures,
+            font=ctk.CTkFont(size=12),
+        ).pack(side="left", padx=(0, 20))
+
+        ctk.CTkCheckBox(
+            prod_frame, text="Options  (auto expiry + all strikes)",
+            variable=self.var_stock_options,
+            font=ctk.CTkFont(size=12),
+        ).pack(side="left")
+
+        # Row 4: Advanced sliders
+        adv_frame = ctk.CTkFrame(cfg_frame, fg_color="transparent")
+        adv_frame.grid(row=4, column=0, columnspan=4, padx=14,
+                       pady=(4, 12), sticky="ew")
+
+        def mini_slider(parent, label, var, from_, to, steps):
+            f = ctk.CTkFrame(parent, fg_color="transparent")
+            ctk.CTkLabel(f, text=label, font=ctk.CTkFont(size=11),
+                          text_color=C_DIM).pack(anchor="w")
+            row = ctk.CTkFrame(f, fg_color="transparent")
+            row.pack(fill="x")
+            ctk.CTkSlider(row, from_=from_, to=to, variable=var,
+                           number_of_steps=steps, width=160).pack(side="left")
+            ctk.CTkLabel(row, textvariable=var, width=44,
+                          font=ctk.CTkFont(size=11)).pack(side="left", padx=(6,0))
+            return f
+
+        mini_slider(adv_frame, "Workers", self.var_stock_workers,
+                    1, 50, 49).pack(side="left", padx=(0, 24))
+        mini_slider(adv_frame, "API Calls/Min", self.var_stock_cpm,
+                    10, 200, 190).pack(side="left", padx=(0, 24))
+        mini_slider(adv_frame, "Chunk Min (1sec)", self.var_stock_chunk,
+                    5, 60, 11).pack(side="left")
+
+        # ── Stats strip ───────────────────────────────────────
+        self._stock_stat_vars = {
+            "days":      ctk.StringVar(value="0"),
+            "files":     ctk.StringVar(value="0"),
+            "rows":      ctk.StringVar(value="0"),
+            "api_calls": ctk.StringVar(value="0"),
+        }
+
+        stats_frame = ctk.CTkFrame(parent, fg_color=C_BG_STATS,
+                                    corner_radius=8, height=64)
+        stats_frame.grid(row=1, column=0, padx=8, pady=4, sticky="ew")
+        stats_frame.grid_propagate(False)
+        stats_frame.grid_columnconfigure((0,1,2,3), weight=1)
+
+        for col, (label, key) in enumerate([
+            ("📅 Days", "days"), ("💾 Files", "files"),
+            ("📊 Rows", "rows"), ("🔌 API Calls", "api_calls"),
+        ]):
+            f = ctk.CTkFrame(stats_frame, fg_color="transparent")
+            f.grid(row=0, column=col, padx=6, pady=6)
+            ctk.CTkLabel(f, text=label, font=ctk.CTkFont(size=10),
+                          text_color=C_DIM).pack()
+            ctk.CTkLabel(f, textvariable=self._stock_stat_vars[key],
+                          font=ctk.CTkFont(size=18, weight="bold"),
+                          text_color=C_ACCENT).pack()
+
+        # ── Button row ────────────────────────────────────────
+        bf = ctk.CTkFrame(parent, fg_color="transparent")
+        bf.grid(row=2, column=0, padx=8, pady=4, sticky="ew")
+
+        self._btn_stock_start = ctk.CTkButton(
+            bf, text="▶  Start Download", width=180, height=42,
+            fg_color=C_BTN_GREEN, hover_color=C_BTN_GHOVER,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            command=self._start_stock_download,
+        )
+        self._btn_stock_start.pack(side="left", padx=(0, 8))
+
+        self._btn_stock_stop = ctk.CTkButton(
+            bf, text="⏹  Stop", width=110, height=42,
+            fg_color=C_BTN_RED, hover_color=C_BTN_RHOVER,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            command=self._stop_stock_download, state="disabled",
+        )
+        self._btn_stock_stop.pack(side="left", padx=(0, 8))
+
+        ctk.CTkButton(
+            bf, text="🗑  Clear Log", width=110, height=42,
+            command=self._clear_stock_log,
+        ).pack(side="left", padx=(0, 8))
+
+        ctk.CTkButton(
+            bf, text="📂  Open Folder", width=120, height=42,
+            command=self._open_stock_dir,
+        ).pack(side="left")
+
+        # ── Log area ──────────────────────────────────────────
+        self._stock_log_text = ctk.CTkTextbox(
+            parent,
+            font=ctk.CTkFont(family="Courier", size=11),
+            fg_color=C_BG_LOG, text_color="#d4d4d4",
+            corner_radius=8, wrap="word",
+        )
+        self._stock_log_text.grid(row=3, column=0, padx=8, pady=(4, 8),
+                                   sticky="nsew")
+
+    # ── Stock search popup ────────────────────────────────────────────────────
+
+    def _open_stock_search(self):
+        """Open a searchable popup to pick a stock from the master list."""
+        if not self._stock_list:
+            messagebox.showinfo(
+                "Load Stocks First",
+                "Click 'Load Stocks' to download the NSE Security Master first."
+            )
+            return
+
+        popup = ctk.CTkToplevel(self)
+        popup.title("Select Stock")
+        popup.geometry("460x520")
+        popup.grab_set()
+
+        search_var = ctk.StringVar()
+        ctk.CTkLabel(popup, text="Search by name or code:",
+                      font=ctk.CTkFont(size=12)).pack(padx=14, pady=(14, 4), anchor="w")
+        ctk.CTkEntry(popup, textvariable=search_var, width=420,
+                      placeholder_text="e.g. RELIANCE or RELIND"
+                      ).pack(padx=14, pady=(0, 8))
+
+        listbox_frame = ctk.CTkScrollableFrame(popup, height=380)
+        listbox_frame.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        listbox_frame.grid_columnconfigure(0, weight=1)
+
+        buttons = []
+
+        def refresh(query=""):
+            for b in buttons:
+                b.destroy()
+            buttons.clear()
+            q = query.upper()
+            results = [
+                (code, name) for code, name in self._stock_list
+                if q in code.upper() or q in name.upper()
+            ][:80]
+            for i, (code, name) in enumerate(results):
+                b = ctk.CTkButton(
+                    listbox_frame,
+                    text=f"{code:<12}  {name[:35]}",
+                    font=ctk.CTkFont(family="Courier", size=11),
+                    anchor="w", height=28,
+                    fg_color="transparent", hover_color="#1e293b",
+                    command=lambda c=code: (
+                        self.var_stock_code.set(c),
+                        popup.destroy(),
+                    ),
+                )
+                b.grid(row=i, column=0, sticky="ew", pady=1)
+                buttons.append(b)
+
+        refresh()
+        search_var.trace_add("write", lambda *_: refresh(search_var.get()))
+
+    # ── Load stock list from Security Master ──────────────────────────────────
+
+    def _load_stock_list(self):
+        self._stock_log("📥 Loading NSE Security Master...")
+
+        def _do():
+            try:
+                sm = get_security_master()
+                sm.load(log_fn=self._stock_log_queue.put)
+                df = sm.eq_stocks()
+                self._stock_list = list(
+                    zip(df["ShortName"].tolist(), df["CompanyName"].tolist())
+                )
+                self._stock_log_queue.put(
+                    f"✅ {len(self._stock_list)} EQ stocks loaded. "
+                    f"Click '🔍 Search' to pick a stock."
+                )
+            except Exception as e:
+                self._stock_log_queue.put(f"❌ Failed to load: {e}")
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    # ── Stock download control ────────────────────────────────────────────────
+
+    def _validate_stock(self) -> bool:
+        errors = []
+        if not self.var_api_key.get().strip():     errors.append("• API Key missing (Auth tab)")
+        if not self.var_api_secret.get().strip():  errors.append("• API Secret missing (Auth tab)")
+        if not self.var_api_session.get().strip(): errors.append("• Session Token missing (Auth tab)")
+        if not self.var_stock_code.get().strip():  errors.append("• Stock code is required")
+        if not self.var_stock_out_dir.get().strip(): errors.append("• Output directory required")
+        if not any([self.var_stock_spot.get(),
+                    self.var_stock_futures.get(),
+                    self.var_stock_options.get()]):
+            errors.append("• Select at least one product (Spot / Futures / Options)")
+        for field, name in [(self.var_stock_from, "From Date"),
+                            (self.var_stock_to, "To Date")]:
+            try:
+                date.fromisoformat(field.get())
+            except ValueError:
+                errors.append(f"• {name} must be YYYY-MM-DD")
+        if errors:
+            messagebox.showerror("Validation Error", "\n".join(errors))
+            return False
+        return True
+
+    def _start_stock_download(self):
+        if not self._validate_stock():
+            return
+
+        self._stop_stock_event.clear()
+
+        for k in self._stock_stat_vars:
+            self._stock_stat_vars[k].set("0")
+
+        self._btn_stock_start.configure(state="disabled")
+        self._btn_stock_stop.configure(state="normal")
+        self._set_status("Downloading stocks…", C_ORANGE)
+        self.tabs.set("📈  Stocks")
+
+        config = {
+            "api_key":           self.var_api_key.get().strip(),
+            "api_secret":        self.var_api_secret.get().strip(),
+            "api_session":       self.var_api_session.get().strip(),
+            "stock_code":        self.var_stock_code.get().strip().upper(),
+            "interval":          self.var_stock_interval.get(),
+            "from_date":         date.fromisoformat(self.var_stock_from.get()),
+            "to_date":           date.fromisoformat(self.var_stock_to.get()),
+            "out_dir":           self.var_stock_out_dir.get().strip(),
+            "download_spot":     bool(self.var_stock_spot.get()),
+            "download_futures":  bool(self.var_stock_futures.get()),
+            "download_options":  bool(self.var_stock_options.get()),
+            "max_workers":       int(self.var_stock_workers.get()),
+            "calls_per_minute":  float(self.var_stock_cpm.get()),
+            "chunk_minutes":     int(self.var_stock_chunk.get()),
+        }
+
+        def _run():
+            dl = StockDownloader(
+                config,
+                log_fn=self._stock_log_queue.put,
+                stats_fn=self._update_stock_stat,
+                stop_event=self._stop_stock_event,
+            )
+            if dl.connect():
+                dl.run()
+            self.after(0, self._on_stock_download_done)
+
+        self._stock_thread = threading.Thread(target=_run, daemon=True)
+        self._stock_thread.start()
+
+    def _stop_stock_download(self):
+        self._stop_stock_event.set()
+        self._stock_log_queue.put("⚠️ Stop signal sent…")
+        self._btn_stock_stop.configure(state="disabled")
+        self._set_status("Stopping…", C_ORANGE)
+
+    def _on_stock_download_done(self):
+        self._btn_stock_start.configure(state="normal")
+        self._btn_stock_stop.configure(state="disabled")
+        if self._stop_stock_event.is_set():
+            self._set_status("Stopped", C_DIM)
+        else:
+            self._set_status("Stock download complete ✅", C_GREEN)
+
+    # ── Stock log ─────────────────────────────────────────────────────────────
+
+    def _stock_log(self, msg: str):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self._stock_log_text.configure(state="normal")
+        self._stock_log_text.insert("end", f"[{ts}]  {msg}\n")
+        self._stock_log_text.see("end")
+        self._stock_log_text.configure(state="disabled")
+
+    def _clear_stock_log(self):
+        self._stock_log_text.configure(state="normal")
+        self._stock_log_text.delete("0.0", "end")
+        self._stock_log_text.configure(state="disabled")
+
+    # ── Stock helpers ─────────────────────────────────────────────────────────
+
+    def _stock_browse_dir(self):
+        d = filedialog.askdirectory(title="Select Output Directory")
+        if d:
+            self.var_stock_out_dir.set(d)
+
+    def _open_stock_dir(self):
+        d = self.var_stock_out_dir.get().strip()
+        if d and os.path.isdir(d):
+            os.startfile(d) if os.name == "nt" else os.system(f'open "{d}"')
+        else:
+            messagebox.showinfo("Not Found", "Output directory does not exist yet.")
+
+    def _update_stock_stat(self, key: str, value: int):
+        def _do():
+            if key in self._stock_stat_vars:
+                self._stock_stat_vars[key].set(f"{value:,}")
+            if key == "api_calls":
+                self._lbl_api.configure(text=f"API calls: {value:,}  ")
+        self.after(0, _do)

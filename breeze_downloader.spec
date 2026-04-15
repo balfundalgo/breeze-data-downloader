@@ -47,6 +47,7 @@ a = Analysis(
         # our packages
         "core",
         "core.downloader",
+        "core.stock_downloader",
         "gui",
         "gui.app",
     ] + breeze_hidden,
