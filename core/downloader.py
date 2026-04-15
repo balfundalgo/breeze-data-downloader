@@ -285,20 +285,25 @@ class BreezeDownloader:
         return None
 
     # ── VIX Download ─────────────────────────────────────────
+    # Confirmed via NSE SecurityMaster.zip + API probe:
+    #   stock_code = "INDVIX"  (not "INDIAVIX")
+    #   Source: NSEScripMaster.txt → ShortName=INDVIX, CompanyName=INDIA VIX VOLATALITY INDEX
+
+    VIX_STOCK_CODE = "INDVIX"
 
     def _download_vix_day(self, d: date, out_dir: str) -> int:
         """
-        Download India VIX data for one trading day.
-        Returns row count saved, -1 if already exists, 0 if no data.
+        Download India VIX (INDVIX) data for one trading day.
+        Returns: row count saved | -1 if already exists | 0 if no data.
         """
         self._ensure_dir(out_dir)
         out_csv = os.path.join(out_dir, f"{d.isoformat()}.csv")
         if os.path.exists(out_csv):
             return -1
 
-        interval  = self.config["interval"]
+        interval      = self.config["interval"]
         open_, close_ = self._day_bounds(d)
-        all_data  = []
+        all_data      = []
 
         if interval == "1minute":
             try:
@@ -307,7 +312,7 @@ class BreezeDownloader:
                     interval="1minute",
                     from_date=self._iso_z(open_),
                     to_date=self._iso_z(close_),
-                    stock_code="INDIAVIX",
+                    stock_code=self.VIX_STOCK_CODE,
                     exchange_code="NSE",
                     product_type="cash",
                     expiry_date="", right="", strike_price="",
@@ -319,7 +324,7 @@ class BreezeDownloader:
                 self.log(f"   ⚠️ VIX error: {str(e)[:60]}")
                 return 0
         else:
-            # 1-second: chunked
+            # 1-second: chunked into 15-min windows (≤1000 candles each)
             chunk_min = self.config.get("chunk_minutes", 15)
             for cs, ce in self._get_time_chunks(d, chunk_min):
                 if self.stop_event.is_set():
@@ -330,7 +335,7 @@ class BreezeDownloader:
                         interval="1second",
                         from_date=self._iso_z(cs),
                         to_date=self._iso_z(ce),
-                        stock_code="INDIAVIX",
+                        stock_code=self.VIX_STOCK_CODE,
                         exchange_code="NSE",
                         product_type="cash",
                         expiry_date="", right="", strike_price="",
@@ -726,7 +731,7 @@ class BreezeDownloader:
 
             # 2b. VIX download
             if cfg.get("download_vix", False):
-                vix_dir = os.path.join(out_dir, f"INDIAVIX_{self._interval_label()}")
+                vix_dir = os.path.join(out_dir, f"INDVIX_{self._interval_label()}")
                 rows = self._download_vix_day(d, vix_dir)
                 if rows > 0:
                     self.log(f"   📈 VIX saved: {rows:,} rows")
