@@ -284,6 +284,72 @@ class BreezeDownloader:
                     pass
         return None
 
+    # ── VIX Download ─────────────────────────────────────────
+
+    def _download_vix_day(self, d: date, out_dir: str) -> int:
+        """
+        Download India VIX data for one trading day.
+        Returns row count saved, -1 if already exists, 0 if no data.
+        """
+        self._ensure_dir(out_dir)
+        out_csv = os.path.join(out_dir, f"{d.isoformat()}.csv")
+        if os.path.exists(out_csv):
+            return -1
+
+        interval  = self.config["interval"]
+        open_, close_ = self._day_bounds(d)
+        all_data  = []
+
+        if interval == "1minute":
+            try:
+                r = self._safe_call(
+                    "get_historical_data_v2",
+                    interval="1minute",
+                    from_date=self._iso_z(open_),
+                    to_date=self._iso_z(close_),
+                    stock_code="INDIAVIX",
+                    exchange_code="NSE",
+                    product_type="cash",
+                    expiry_date="", right="", strike_price="",
+                )
+                all_data = r.get("Success") or []
+            except InterruptedError:
+                raise
+            except Exception as e:
+                self.log(f"   ⚠️ VIX error: {str(e)[:60]}")
+                return 0
+        else:
+            # 1-second: chunked
+            chunk_min = self.config.get("chunk_minutes", 15)
+            for cs, ce in self._get_time_chunks(d, chunk_min):
+                if self.stop_event.is_set():
+                    raise InterruptedError("Stopped by user")
+                try:
+                    r = self._safe_call(
+                        "get_historical_data_v2",
+                        interval="1second",
+                        from_date=self._iso_z(cs),
+                        to_date=self._iso_z(ce),
+                        stock_code="INDIAVIX",
+                        exchange_code="NSE",
+                        product_type="cash",
+                        expiry_date="", right="", strike_price="",
+                    )
+                    all_data.extend(r.get("Success") or [])
+                except InterruptedError:
+                    raise
+                except Exception:
+                    pass
+
+        if not all_data:
+            return 0
+
+        df = pd.DataFrame(all_data)
+        if "datetime" in df.columns:
+            df.drop_duplicates(subset=["datetime"], keep="first", inplace=True)
+        df.to_csv(out_csv, index=False)
+        return len(df)
+
     # ── Expiry Discovery ─────────────────────────────────────
 
     def _candidate_expiries(self, d: date) -> list[date]:
@@ -596,6 +662,7 @@ class BreezeDownloader:
         self.log(f"📂  Output      : {out_dir}")
         self.log(f"🔧  Workers     : {cfg.get('max_workers', 20)}")
         self.log(f"⚡  API limit   : {cfg.get('calls_per_minute', 90)}/min")
+        self.log(f"📈  VIX         : {'Yes' if cfg.get('download_vix') else 'No'}")
         self.log("─" * 60)
 
         totals = {"days": 0, "files": 0, "skipped": 0, "rows": 0}
@@ -656,6 +723,17 @@ class BreezeDownloader:
                             self.log(f"   💾 Spot saved: {len(sdf):,} rows")
                 else:
                     self.log("   ⏭️  Spot already exists")
+
+            # 2b. VIX download
+            if cfg.get("download_vix", False):
+                vix_dir = os.path.join(out_dir, f"INDIAVIX_{self._interval_label()}")
+                rows = self._download_vix_day(d, vix_dir)
+                if rows > 0:
+                    self.log(f"   📈 VIX saved: {rows:,} rows")
+                elif rows == -1:
+                    self.log("   ⏭️  VIX already exists")
+                else:
+                    self.log("   ⚠️  VIX — no data returned")
 
             # 3. ATM + Expiry
             atm    = self._round_step(spot_close, self.STRIKE_STEP)

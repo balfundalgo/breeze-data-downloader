@@ -79,6 +79,7 @@ class BreezeDownloaderApp(ctk.CTk):
             "max_workers":       int(self.var_workers.get()),
             "calls_per_minute":  int(self.var_cpm.get()),
             "download_spot":     bool(self.var_spot.get()),
+            "download_vix":      bool(self.var_vix.get()),
             "chunk_minutes":     int(self.var_chunk_min.get()),
         }
         with open(CONFIG_FILE, "w") as f:
@@ -98,6 +99,7 @@ class BreezeDownloaderApp(ctk.CTk):
         if "max_workers"      in c: self.var_workers.set(c["max_workers"])
         if "calls_per_minute" in c: self.var_cpm.set(c["calls_per_minute"])
         if "download_spot"    in c: self.var_spot.set(c["download_spot"])
+        if "download_vix"     in c: self.var_vix.set(c["download_vix"])
         if "chunk_minutes"    in c: self.var_chunk_min.set(c["chunk_minutes"])
         # Trigger chunk visibility
         self._on_interval_change(self.var_interval.get())
@@ -221,6 +223,7 @@ class BreezeDownloaderApp(ctk.CTk):
         self.var_workers     = ctk.DoubleVar(value=20)
         self.var_cpm         = ctk.DoubleVar(value=90)
         self.var_spot        = ctk.BooleanVar(value=True)
+        self.var_vix         = ctk.BooleanVar(value=False)
         self.var_chunk_min   = ctk.DoubleVar(value=15)
 
         def lbl(text, row, col=0, **kw):
@@ -311,7 +314,14 @@ class BreezeDownloaderApp(ctk.CTk):
         ctk.CTkCheckBox(
             parent, text="Download Spot Data alongside options",
             variable=self.var_spot, font=ctk.CTkFont(size=12),
-        ).grid(row=10, column=0, columnspan=2, padx=24, pady=(16, 8), sticky="w")
+        ).grid(row=10, column=0, columnspan=2, padx=24, pady=(16, 4), sticky="w")
+
+        # VIX toggle
+        ctk.CTkCheckBox(
+            parent,
+            text="Download India VIX  (saved to INDIAVIX_1MIN / INDIAVIX_1SEC folder)",
+            variable=self.var_vix, font=ctk.CTkFont(size=12),
+        ).grid(row=11, column=0, columnspan=2, padx=24, pady=(4, 16), sticky="w")
 
     # ── Download Tab ──────────────────────────────────────────────────────────
 
@@ -492,6 +502,7 @@ class BreezeDownloaderApp(ctk.CTk):
             "max_workers":          int(self.var_workers.get()),
             "calls_per_minute":     float(self.var_cpm.get()),
             "download_spot":        bool(self.var_spot.get()),
+            "download_vix":         bool(self.var_vix.get()),
             "chunk_minutes":        int(self.var_chunk_min.get()),
         }
 
