@@ -484,6 +484,29 @@ class BreezeDownloader:
 
     # ── Per-Strike Download ───────────────────────────────────
 
+    def _is_file_complete(self, csv_path: str, d: date) -> bool:
+        """
+        Check if an existing CSV file has data starting from market open (09:15).
+        Returns True if complete (safe to skip), False if needs re-download.
+        Only validates 1-second files since 1-minute is a single call.
+        """
+        try:
+            # Read just the first few rows — fast
+            df = pd.read_csv(csv_path, nrows=5)
+            if "datetime" not in df.columns or df.empty:
+                return False
+            first_ts = pd.to_datetime(df["datetime"].iloc[0])
+            expected_open = datetime(d.year, d.month, d.day,
+                                     *self.MARKET_OPEN, 0)
+            # Allow up to 5 minutes grace — some illiquid strikes
+            # genuinely have no trades in the first few seconds
+            grace = 5   # minutes
+            if first_ts > pd.Timestamp(expected_open) + pd.Timedelta(minutes=grace):
+                return False   # starts too late — needs re-download
+            return True
+        except Exception:
+            return False   # can't read → re-download to be safe
+
     def _download_strike_1min(
         self, d: date, expiry: date, strike: int, right: str,
         out_dir: str, progress: ProgressTracker,
@@ -537,16 +560,39 @@ class BreezeDownloader:
         out_dir: str, progress: ProgressTracker,
     ) -> dict:
         key = (d.isoformat(), str(strike), right, "1second")
-        if progress.is_done(key):
-            return {"skipped": 1, "files": 0, "rows": 0}
 
         out_csv = f"{out_dir}/{d.isoformat()}_{strike}_{right[0].upper()}E.csv"
+
+        # If file exists, validate it starts from 09:15 (not 09:58 etc.)
         if os.path.exists(out_csv):
-            progress.mark_done(key)
-            return {"skipped": 1, "files": 0, "rows": 0}
+            if self._is_file_complete(out_csv, d):
+                # File is good — skip
+                progress.mark_done(key)
+                return {"skipped": 1, "files": 0, "rows": 0}
+            else:
+                # File is incomplete — delete and re-download
+                with self._print_lock:
+                    self.log(f"    🔄 {strike}{right[0].upper()}E: incomplete file, re-downloading")
+                try:
+                    os.remove(out_csv)
+                except Exception:
+                    pass
+                # Remove from progress so it re-runs
+                try:
+                    with progress.lock:
+                        progress.completed.discard(key)
+                except Exception:
+                    pass
+
+        elif progress.is_done(key):
+            # Marked done but file missing — re-download
+            return {"skipped": 0, "files": 0, "rows": 0}
 
         exp_str   = self._iso_z(datetime(expiry.year, expiry.month, expiry.day, 7, 0, 0))
-        chunk_min = self.config.get("chunk_minutes", 15)
+        # 1-second API limit: 1000 candles per request = max 16.6 min window.
+        # Hard-cap chunk_minutes to 15 to stay safely under the 1000-candle limit.
+        # If user sets a larger value, we silently cap it here.
+        chunk_min = min(self.config.get("chunk_minutes", 15), 15)
         chunks    = self._get_time_chunks(d, chunk_min)
         all_data  = []
 
@@ -591,6 +637,37 @@ class BreezeDownloader:
     def _interval_label(self) -> str:
         return "1MIN" if self.config["interval"] == "1minute" else "1SEC"
 
+    def _download_single_chunk(
+        self, chunk_start: datetime, chunk_end: datetime,
+        strike: int, right: str, expiry: date,
+    ) -> list:
+        """Download one 15-min chunk. Returns raw rows list."""
+        if self.stop_event.is_set():
+            raise InterruptedError("Stopped")
+        exp_str = self._iso_z(datetime(expiry.year, expiry.month, expiry.day, 7, 0, 0))
+        try:
+            r = self._safe_call(
+                "get_historical_data_v2",
+                interval="1second",
+                from_date=self._iso_z(chunk_start),
+                to_date=self._iso_z(chunk_end),
+                stock_code=self.config["instrument"],
+                exchange_code="NFO",
+                product_type="options",
+                expiry_date=exp_str,
+                right=right,
+                strike_price=str(strike),
+            )
+            return r.get("Success") or []
+        except InterruptedError:
+            raise
+        except Exception as e:
+            with self._print_lock:
+                self.log(f"      ⚠️ chunk {strike}{right[0].upper()}E "
+                         f"{chunk_start.strftime('%H:%M')}→{chunk_end.strftime('%H:%M')}: "
+                         f"{str(e)[:40]}")
+            return []
+
     def _process_day(
         self, d: date, expiry: date, strikes: list[int], progress: ProgressTracker
     ) -> dict:
@@ -602,43 +679,141 @@ class BreezeDownloader:
         )
         self._ensure_dir(out_dir)
 
-        tasks       = [(s, r) for s in strikes if s > 0 for r in ("call", "put")]
-        total       = {"skipped": 0, "files": 0, "rows": 0}
-        done        = 0
-        workers     = self.config.get("max_workers", 20)
-        download_fn = (
-            self._download_strike_1min
-            if self.config["interval"] == "1minute"
-            else self._download_strike_1sec
-        )
+        total   = {"skipped": 0, "files": 0, "rows": 0}
+
+        # ── 1-minute: one call per strike, simple parallel ────
+        if self.config["interval"] == "1minute":
+            tasks   = [(s, r) for s in strikes if s > 0 for r in ("call", "put")]
+            workers = self.config.get("max_workers", 20)
+            done    = 0
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futures = {
+                    ex.submit(self._download_strike_1min,
+                               d, expiry, s, r, out_dir, progress): (s, r)
+                    for s, r in tasks
+                }
+                for fut in as_completed(futures):
+                    if self.stop_event.is_set():
+                        break
+                    s, r = futures[fut]
+                    try:
+                        st = fut.result()
+                        total["skipped"] += st["skipped"]
+                        total["files"]   += st["files"]
+                        total["rows"]    += st["rows"]
+                        if st["files"] > 0:
+                            with self._print_lock:
+                                self.log(f"      💾 {s}{r[0].upper()}E: {st['rows']:,} rows")
+                    except Exception as e:
+                        with self._print_lock:
+                            self.log(f"      ❌ {s}{r[0].upper()}E: {str(e)[:60]}")
+                    done += 1
+                    if done % 20 == 0:
+                        with self._print_lock:
+                            self.log(f"      ⏳ {done}/{len(tasks)} | "
+                                     f"API calls: {self.rate_limiter.calls}")
+            return total
+
+        # ── 1-second: FLAT CHUNK POOL ─────────────────────────
+        # Instead of: 50 strikes × 25 chunks sequentially
+        # We do:      all (strike, right, chunk) as independent tasks
+        # This means all 5000 chunks compete for the thread pool simultaneously,
+        # overlapping network latency across all strikes at once.
+
+        chunk_min = min(self.config.get("chunk_minutes", 15), 15)
+        chunks    = self._get_time_chunks(d, chunk_min)
+
+        # Build task list — skip already-complete files upfront
+        pending_strikes = {}  # (strike, right) → out_csv
+        for s in strikes:
+            if s <= 0:
+                continue
+            for r in ("call", "put"):
+                key     = (d.isoformat(), str(s), r, "1second")
+                out_csv = f"{out_dir}/{d.isoformat()}_{s}_{r[0].upper()}E.csv"
+
+                if os.path.exists(out_csv):
+                    if self._is_file_complete(out_csv, d):
+                        progress.mark_done(key)
+                        total["skipped"] += 1
+                        continue
+                    else:
+                        with self._print_lock:
+                            self.log(f"    🔄 {s}{r[0].upper()}E: incomplete, re-downloading")
+                        try:
+                            os.remove(out_csv)
+                        except Exception:
+                            pass
+                elif progress.is_done(key):
+                    total["skipped"] += 1
+                    continue
+
+                pending_strikes[(s, r)] = out_csv
+
+        if not pending_strikes:
+            return total
+
+        # Submit every chunk of every pending strike as its own task
+        # Use a larger thread pool — more threads = better overlap of network waits
+        n_tasks  = len(pending_strikes) * len(chunks)
+        # Use more workers than strikes since each "worker" now does one tiny chunk
+        workers  = min(self.config.get("max_workers", 20) * 5, 500)
+
+        self.log(f"      🚀 Flat chunk pool: {len(pending_strikes)} strikes "
+                 f"× {len(chunks)} chunks = {n_tasks} tasks | pool={workers}")
+
+        # chunk_results[(strike, right)][chunk_index] = rows_list
+        chunk_results = {sr: [None] * len(chunks) for sr in pending_strikes}
+        done_count    = [0]
+        lock          = threading.Lock()
 
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            futures = {
-                ex.submit(download_fn, d, expiry, s, r, out_dir, progress): (s, r)
-                for s, r in tasks
-            }
+            futures = {}
+            for (s, r) in pending_strikes:
+                for ci, (cs, ce) in enumerate(chunks):
+                    fut = ex.submit(self._download_single_chunk, cs, ce, s, r, expiry)
+                    futures[fut] = (s, r, ci)
+
             for fut in as_completed(futures):
                 if self.stop_event.is_set():
                     break
-                s, r = futures[fut]
+                s, r, ci = futures[fut]
                 try:
-                    stats = fut.result()
-                    total["skipped"] += stats["skipped"]
-                    total["files"]   += stats["files"]
-                    total["rows"]    += stats["rows"]
-                    if stats["files"] > 0:
-                        with self._print_lock:
-                            self.log(f"      💾 {s}{r[0].upper()}E: {stats['rows']:,} rows")
+                    rows = fut.result()
+                    chunk_results[(s, r)][ci] = rows
                 except InterruptedError:
                     break
                 except Exception as e:
-                    with self._print_lock:
-                        self.log(f"      ❌ {s}{r[0].upper()}E failed: {str(e)[:60]}")
+                    chunk_results[(s, r)][ci] = []
+                with lock:
+                    done_count[0] += 1
+                    if done_count[0] % 200 == 0:
+                        with self._print_lock:
+                            self.log(f"      ⏳ {done_count[0]}/{n_tasks} chunks | "
+                                     f"API: {self.rate_limiter.calls}")
 
-                done += 1
-                if done % 20 == 0:
-                    with self._print_lock:
-                        self.log(f"      ⏳ {done}/{len(tasks)} | API calls: {self.rate_limiter.calls}")
+        # Assemble and save CSVs
+        for (s, r), out_csv in pending_strikes.items():
+            key      = (d.isoformat(), str(s), r, "1second")
+            all_rows = []
+            for rows in chunk_results[(s, r)]:
+                if rows:
+                    all_rows.extend(rows)
+
+            if not all_rows:
+                progress.mark_done(key)
+                continue
+
+            df = pd.DataFrame(all_rows)
+            if "datetime" in df.columns:
+                df.drop_duplicates(subset=["datetime"], keep="first", inplace=True)
+                df.sort_values("datetime", inplace=True)
+            df.to_csv(out_csv, index=False)
+            progress.mark_done(key)
+            total["files"] += 1
+            total["rows"]  += len(df)
+            with self._print_lock:
+                self.log(f"      💾 {s}{r[0].upper()}E: {len(df):,} rows")
 
         return total
 
@@ -703,7 +878,8 @@ class BreezeDownloader:
                         # 1sec spot: download separately
                         self.log(f"   📥 Downloading 1sec spot...")
                         spot_data = []
-                        for cs, ce in self._get_time_chunks(d, cfg.get("chunk_minutes", 15)):
+                        # Hard-cap chunk to 15 min for 1-second data (1000 candle API limit)
+                        for cs, ce in self._get_time_chunks(d, min(cfg.get("chunk_minutes", 15), 15)):
                             if self.stop_event.is_set(): break
                             try:
                                 r = self._safe_call(
