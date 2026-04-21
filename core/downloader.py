@@ -781,7 +781,8 @@ class BreezeDownloader:
         # Use a larger thread pool — more threads = better overlap of network waits
         n_tasks  = len(pending_strikes) * len(chunks)
         # Use more workers than strikes since each "worker" now does one tiny chunk
-        workers  = min(self.config.get("max_workers", 20) * 5, 500)
+        # With 100 base workers → 1000 chunk threads → maximises parallelism
+        workers  = min(self.config.get("max_workers", 100) * 10, 1000)
 
         self.log(f"      🚀 Flat chunk pool: {len(pending_strikes)} strikes "
                  f"× {len(chunks)} chunks = {n_tasks} tasks | pool={workers}")
