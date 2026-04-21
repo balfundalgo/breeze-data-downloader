@@ -17,7 +17,11 @@ from typing import Callable
 # ─────────────────────────────────────────────────────────────
 
 class RateLimiter:
-    """Thread-safe token-bucket rate limiter."""
+    """
+    Thread-safe token-bucket rate limiter.
+    Sleeps OUTSIDE the lock so threads don't serialize behind each other.
+    This allows true parallel throughput up to calls_per_minute.
+    """
 
     def __init__(self, calls_per_minute: float):
         self.min_interval   = 60.0 / calls_per_minute
@@ -26,19 +30,25 @@ class RateLimiter:
         self.total_calls    = 0
 
     def wait(self, stop_event: threading.Event | None = None) -> int:
-        with self.lock:
-            elapsed = time.time() - self.last_call_time
-            sleep   = self.min_interval - elapsed
-            if sleep > 0:
-                if stop_event:
-                    stop_event.wait(timeout=sleep)
-                    if stop_event.is_set():
-                        return self.total_calls
-                else:
-                    time.sleep(sleep)
-            self.last_call_time = time.time()
-            self.total_calls   += 1
-            return self.total_calls
+        while True:
+            with self.lock:
+                now     = time.time()
+                elapsed = now - self.last_call_time
+                if elapsed >= self.min_interval:
+                    # Slot available — take it immediately
+                    self.last_call_time = now
+                    self.total_calls   += 1
+                    return self.total_calls
+                # Calculate sleep needed WITHOUT holding lock
+                sleep = self.min_interval - elapsed
+
+            # Sleep OUTSIDE the lock so other threads can check simultaneously
+            if stop_event:
+                stop_event.wait(timeout=sleep)
+                if stop_event.is_set():
+                    return self.total_calls
+            else:
+                time.sleep(sleep)
 
     @property
     def calls(self) -> int:
@@ -225,11 +235,25 @@ class BreezeDownloader:
             except InterruptedError:
                 raise
             except Exception as e:
-                if attempt >= max_retries - 1 or not self._is_transient(str(e)):
+                err = str(e).lower()
+                is_429     = "429" in err or "too many requests" in err
+                transient  = is_429 or any(p in err for p in [
+                    "connection reset", "connection aborted", "read timed out",
+                    "timeout", "temporarily unavailable", "502", "503", "504",
+                    "bad gateway", "ssl", "handshake", "connection refused",
+                    "broken pipe", "remote end closed", "connection error",
+                ])
+                if attempt >= max_retries - 1 or not transient:
                     raise
-                sleep = (2.0 * (2 ** attempt)) + random.uniform(0, 1.0)
-                with self._print_lock:
-                    self.log(f"    ⚠️ Retry {attempt+1}/{max_retries}: {str(e)[:80]}")
+                # 429 → longer backoff to let server recover
+                if is_429:
+                    sleep = 10.0 + random.uniform(0, 5.0)
+                    with self._print_lock:
+                        self.log(f"    ⚡ 429 rate limit hit — backing off {sleep:.0f}s")
+                else:
+                    sleep = (2.0 * (2 ** attempt)) + random.uniform(0, 1.0)
+                    with self._print_lock:
+                        self.log(f"    ⚠️ Retry {attempt+1}/{max_retries}: {str(e)[:80]}")
                 self.stop_event.wait(timeout=sleep)
 
     def _get_time_chunks(self, d: date, chunk_min: int = 15) -> list:
@@ -841,7 +865,7 @@ class BreezeDownloader:
         self.log(f"📅  Date range  : {from_d} → {to_d}")
         self.log(f"📂  Output      : {out_dir}")
         self.log(f"🔧  Workers     : {cfg.get('max_workers', 20)}")
-        self.log(f"⚡  API limit   : {cfg.get('calls_per_minute', 90)}/min")
+        self.log(f"⚡  API limit   : {cfg.get('calls_per_minute', 300)}/min")
         self.log(f"📈  VIX         : {'Yes' if cfg.get('download_vix') else 'No'}")
         self.log("─" * 60)
 
