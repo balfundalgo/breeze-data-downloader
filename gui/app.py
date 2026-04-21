@@ -15,7 +15,6 @@ import urllib.parse
 from datetime import date, datetime
 
 from core.downloader import BreezeDownloader
-from core.stock_downloader import StockDownloader, get_security_master
 
 CONFIG_FILE = "breeze_downloader_config.json"
 
