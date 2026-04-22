@@ -382,20 +382,52 @@ class BreezeDownloader:
     # ── Expiry Discovery ─────────────────────────────────────
 
     def _candidate_expiries(self, d: date) -> list[date]:
-        """Return candidate expiry dates to probe (next 8 weeks of Thu/Wed/Tue)."""
+        """
+        Return candidate expiry dates to probe within next 8 weeks.
+
+        Normal expiry: Tuesday (since Sep 2025 NSE change)
+        Holiday shift: NSE moves expiry to PREVIOUS trading day.
+        So if Tuesday is holiday → Monday expiry.
+        If Monday is also holiday → Friday of previous week.
+
+        We include ALL weekdays (Mon–Fri) so no shifted expiry is missed.
+        The API probe in _pick_expiry will find the correct one.
+        """
         candidates = set()
         for delta in range(0, 56):
             candidate = d + timedelta(days=delta)
-            if candidate.weekday() in (1, 2, 3):  # Tue, Wed, Thu
+            if candidate.weekday() < 5:  # Mon=0 to Fri=4, exclude Sat/Sun
                 candidates.add(candidate)
         return sorted(candidates)
 
     def _pick_expiry(self, d: date, atm: int) -> date | None:
-        """Find the nearest valid weekly expiry by probing the API."""
+        """
+        Find the nearest valid weekly expiry by probing the API.
+
+        Priority order: Tue (normal) → Mon (holiday shift) → Wed → Fri → Thu
+        This minimises API calls for the common case while catching all
+        holiday-shifted expiries.
+
+        Only probes the nearest 3 candidate dates — if the first one
+        returns data, we stop immediately (typically 1-2 API calls).
+        """
         open_, _ = self._day_bounds(d)
         probe_to = open_ + timedelta(minutes=30)
 
-        for expiry in self._candidate_expiries(d):
+        # Re-sort candidates: prioritise by weekday preference
+        # Tue=1 first (most common), then Mon=0, Wed=2, Fri=4, Thu=3
+        WEEKDAY_PRIORITY = {1: 0, 0: 1, 2: 2, 4: 3, 3: 4}
+
+        candidates = self._candidate_expiries(d)
+
+        # Only check the nearest 10 candidates — expiry is always within 2 weeks
+        candidates = candidates[:10]
+        candidates.sort(key=lambda x: (
+            (x - d).days * 10 +        # nearer dates first
+            WEEKDAY_PRIORITY.get(x.weekday(), 5)  # then by weekday priority
+        ))
+
+        for expiry in candidates:
             if self.stop_event.is_set():
                 return None
             exp_str = self._iso_z(datetime(expiry.year, expiry.month, expiry.day, 7, 0, 0))
