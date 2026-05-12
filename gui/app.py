@@ -322,7 +322,7 @@ class BreezeDownloaderApp(ctk.CTk):
         # Futures toggle
         ctk.CTkCheckBox(
             parent,
-            text="Download Futures  (auto-detects expiry, saves NIFTY_FUTURES_xxx/)",
+            text="Download Futures  (NIFTY & BANKNIFTY, auto-detects expiry)",
             variable=self.var_futures, font=ctk.CTkFont(size=12),
         ).grid(row=11, column=0, columnspan=2, padx=24, pady=(4, 4), sticky="w")
 
@@ -372,13 +372,21 @@ class BreezeDownloaderApp(ctk.CTk):
         bf = ctk.CTkFrame(parent, fg_color="transparent")
         bf.grid(row=1, column=0, padx=8, pady=4, sticky="ew")
 
-        self._btn_start = ctk.CTkButton(
-            bf, text="▶  Start Download", width=180, height=42,
+        self._btn_start_sf = ctk.CTkButton(
+            bf, text="▶  Spot + Futures + VIX", width=200, height=42,
             fg_color=C_BTN_GREEN, hover_color=C_BTN_GHOVER,
-            font=ctk.CTkFont(size=14, weight="bold"),
-            command=self._start_download,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._start_sf_download,
         )
-        self._btn_start.pack(side="left", padx=(0, 8))
+        self._btn_start_sf.pack(side="left", padx=(0, 8))
+
+        self._btn_start_opt = ctk.CTkButton(
+            bf, text="🎯  Download Options", width=180, height=42,
+            fg_color="#1565c0", hover_color="#1976d2",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._start_options_download,
+        )
+        self._btn_start_opt.pack(side="left", padx=(0, 8))
 
         self._btn_stop = ctk.CTkButton(
             bf, text="⏹  Stop", width=110, height=42,
@@ -483,23 +491,66 @@ class BreezeDownloaderApp(ctk.CTk):
             return False
         return True
 
-    def _start_download(self):
+    def _start_sf_download(self):
+        """Start Spot + Futures + VIX download (no options)."""
         if not self._validate():
             return
         self._save_config()
         self._stop_event.clear()
-
-        # Reset stats
         for k in self._stat_vars:
             self._stat_vars[k].set("0")
-        self._totals = {"days": 0, "files": 0, "rows": 0, "api_calls": 0}
-
-        self._btn_start.configure(state="disabled")
+        self._totals = {"days":0,"files":0,"rows":0,"api_calls":0}
+        self._btn_start_sf.configure(state="disabled")
+        self._btn_start_opt.configure(state="disabled")
         self._btn_stop.configure(state="normal")
-        self._set_status("Downloading…", C_ORANGE)
+        self._set_status("Downloading Spot + Futures + VIX…", C_ORANGE)
         self.tabs.set("📥  Download")
 
-        config = {
+        config = self._build_config()
+        config["download_options"] = False   # ← skip options
+
+        def _run():
+            dl = BreezeDownloader(config, self._log_queue.put,
+                                  self._update_stat, self._stop_event)
+            if dl.connect():
+                dl.run()
+            self.after(0, self._on_download_done)
+
+        self._download_thread = threading.Thread(target=_run, daemon=True)
+        self._download_thread.start()
+
+    def _start_options_download(self):
+        """Start Options download (spot used as gate, futures skipped)."""
+        if not self._validate():
+            return
+        self._save_config()
+        self._stop_event.clear()
+        for k in self._stat_vars:
+            self._stat_vars[k].set("0")
+        self._totals = {"days":0,"files":0,"rows":0,"api_calls":0}
+        self._btn_start_sf.configure(state="disabled")
+        self._btn_start_opt.configure(state="disabled")
+        self._btn_stop.configure(state="normal")
+        self._set_status("Downloading Options…", C_ORANGE)
+        self.tabs.set("📥  Download")
+
+        config = self._build_config()
+        config["download_options"] = True
+        config["download_futures"] = False   # ← skip futures in options mode
+
+        def _run():
+            dl = BreezeDownloader(config, self._log_queue.put,
+                                  self._update_stat, self._stop_event)
+            if dl.connect():
+                dl.run()
+            self.after(0, self._on_download_done)
+
+        self._download_thread = threading.Thread(target=_run, daemon=True)
+        self._download_thread.start()
+
+    def _build_config(self) -> dict:
+        """Build config dict from current GUI state."""
+        return {
             "api_key":              self.var_api_key.get().strip(),
             "api_secret":           self.var_api_secret.get().strip(),
             "api_session":          self.var_api_session.get().strip(),
@@ -516,21 +567,6 @@ class BreezeDownloaderApp(ctk.CTk):
             "download_vix":         bool(self.var_vix.get()),
             "chunk_minutes":        int(self.var_chunk_min.get()),
         }
-
-        def _run():
-            dl = BreezeDownloader(
-                config,
-                log_fn=self._log_queue.put,
-                stats_fn=self._update_stat,
-                stop_event=self._stop_event,
-            )
-            if dl.connect():
-                dl.run()
-            self.after(0, self._on_download_done)
-
-        self._download_thread = threading.Thread(target=_run, daemon=True)
-        self._download_thread.start()
-
     def _stop_download(self):
         self._stop_event.set()
         self._log_queue.put("⚠️ Stop signal sent — waiting for current tasks to finish…")
@@ -538,7 +574,8 @@ class BreezeDownloaderApp(ctk.CTk):
         self._set_status("Stopping…", C_ORANGE)
 
     def _on_download_done(self):
-        self._btn_start.configure(state="normal")
+        self._btn_start_sf.configure(state="normal")
+        self._btn_start_opt.configure(state="normal")
         self._btn_stop.configure(state="disabled")
         if self._stop_event.is_set():
             self._set_status("Stopped", C_DIM)

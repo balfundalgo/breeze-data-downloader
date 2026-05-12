@@ -149,6 +149,17 @@ class BreezeDownloader:
     STRIKE_STEP  = 50
     VIX_STOCK_CODE = "INDVIX"
 
+    # Breeze stock_code for futures — BANKNIFTY uses CNXBAN not BANKNIFTY
+    FUTURES_CODE = {
+        "NIFTY":     "NIFTY",
+        "BANKNIFTY": "CNXBAN",
+    }
+
+    def _futures_code(self) -> str:
+        """Return correct Breeze stock_code for futures (BANKNIFTY→CNXBAN)."""
+        return self.FUTURES_CODE.get(self.config["instrument"],
+                                     self.config["instrument"])
+
     def __init__(self, config, log_fn, stats_fn, stop_event):
         self.config     = config
         self.log        = log_fn
@@ -351,12 +362,11 @@ class BreezeDownloader:
                 r = self._safe_call("get_historical_data_v2",
                     interval="1minute",
                     from_date=self._iso_z(open_), to_date=self._iso_z(probe_to),
-                    stock_code=instrument, exchange_code="NFO",
+                    stock_code=self._futures_code(), exchange_code="NFO",
                     product_type="futures", expiry_date=exp_s,
                     right="others", strike_price="0",
                 )
                 if r.get("Success"):
-                    # Cache for all days up to this expiry
                     self._expiry_cache[d.isoformat()] = expiry
                     return expiry
             except InterruptedError: raise
@@ -385,7 +395,7 @@ class BreezeDownloader:
                     r = self._safe_call("get_historical_data_v2",
                         interval="1second",
                         from_date=self._iso_z(cs), to_date=self._iso_z(ce),
-                        stock_code=self.config["instrument"], exchange_code="NFO",
+                        stock_code=self._futures_code(), exchange_code="NFO",
                         product_type="futures", expiry_date=exp_s,
                         right="others", strike_price="0",
                     )
@@ -684,7 +694,7 @@ class BreezeDownloader:
         self.log(f"📦  Products    : " + ", ".join(filter(None, [
             "Spot"    if cfg.get("download_spot")    else "",
             "Futures" if cfg.get("download_futures") else "",
-            "Options" if True                        else "",
+            "Options" if cfg.get("download_options", True) else "",
             "VIX"     if cfg.get("download_vix")     else "",
         ])))
         self.log(f"📂  Output      : {out_dir}")
@@ -773,6 +783,14 @@ class BreezeDownloader:
                     self.log("   ⚠️  Futures — could not detect expiry")
 
             # ── 5. Options ─────────────────────────────────────
+            if not cfg.get("download_options", True):
+                totals["days"] += 1
+                self._update_stats(days=totals["days"],
+                                   files=totals["files"],
+                                   rows=totals["rows"],
+                                   api_calls=self.rate_limiter.calls)
+                continue
+
             atm    = self._round_step(spot_close, self.STRIKE_STEP)
             expiry = self._pick_options_expiry(d, atm)
             if not expiry:
