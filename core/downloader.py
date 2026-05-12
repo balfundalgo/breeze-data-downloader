@@ -155,10 +155,21 @@ class BreezeDownloader:
         "BANKNIFTY": "CNXBAN",
     }
 
+    # Breeze stock_code for spot/cash — same mapping
+    SPOT_CODE = {
+        "NIFTY":     "NIFTY",
+        "BANKNIFTY": "CNXBAN",
+    }
+
     def _futures_code(self) -> str:
         """Return correct Breeze stock_code for futures (BANKNIFTY→CNXBAN)."""
         return self.FUTURES_CODE.get(self.config["instrument"],
                                      self.config["instrument"])
+
+    def _spot_code(self) -> str:
+        """Return correct Breeze stock_code for spot/cash (BANKNIFTY→CNXBAN)."""
+        return self.SPOT_CODE.get(self.config["instrument"],
+                                  self.config["instrument"])
 
     def __init__(self, config, log_fn, stats_fn, stop_event):
         self.config     = config
@@ -265,7 +276,7 @@ class BreezeDownloader:
             r = self._safe_call("get_historical_data_v2",
                 interval="1minute",
                 from_date=self._iso_z(open_), to_date=self._iso_z(close_),
-                stock_code=self.config["instrument"], exchange_code="NSE",
+                stock_code=self._spot_code(), exchange_code="NSE",
                 product_type="cash", expiry_date="", right="", strike_price="",
             )
             rows = r.get("Success") or []
@@ -739,7 +750,7 @@ class BreezeDownloader:
                                 r = self._safe_call("get_historical_data_v2",
                                     interval="1second",
                                     from_date=self._iso_z(cs), to_date=self._iso_z(ce),
-                                    stock_code=inst, exchange_code="NSE",
+                                    stock_code=self._spot_code(), exchange_code="NSE",
                                     product_type="cash", expiry_date="", right="", strike_price="",
                                 )
                                 spot_data.extend(r.get("Success") or [])
