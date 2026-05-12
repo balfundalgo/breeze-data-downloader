@@ -79,6 +79,7 @@ class BreezeDownloaderApp(ctk.CTk):
             "max_workers":       int(self.var_workers.get()),
             "calls_per_minute":  int(self.var_cpm.get()),
             "download_spot":     bool(self.var_spot.get()),
+            "download_futures":  bool(self.var_futures.get()),
             "download_vix":      bool(self.var_vix.get()),
             "chunk_minutes":     int(self.var_chunk_min.get()),
         }
@@ -99,6 +100,7 @@ class BreezeDownloaderApp(ctk.CTk):
         if "max_workers"      in c: self.var_workers.set(c["max_workers"])
         if "calls_per_minute" in c: self.var_cpm.set(c["calls_per_minute"])
         if "download_spot"    in c: self.var_spot.set(c["download_spot"])
+        if "download_futures" in c: self.var_futures.set(c["download_futures"])
         if "download_vix"     in c: self.var_vix.set(c["download_vix"])
         if "chunk_minutes"    in c: self.var_chunk_min.set(c["chunk_minutes"])
         # Trigger chunk visibility
@@ -223,6 +225,7 @@ class BreezeDownloaderApp(ctk.CTk):
         self.var_workers     = ctk.DoubleVar(value=100)
         self.var_cpm         = ctk.DoubleVar(value=300)
         self.var_spot        = ctk.BooleanVar(value=True)
+        self.var_futures     = ctk.BooleanVar(value=False)
         self.var_vix         = ctk.BooleanVar(value=False)
         self.var_chunk_min   = ctk.DoubleVar(value=15)
 
@@ -316,12 +319,19 @@ class BreezeDownloaderApp(ctk.CTk):
             variable=self.var_spot, font=ctk.CTkFont(size=12),
         ).grid(row=10, column=0, columnspan=2, padx=24, pady=(16, 4), sticky="w")
 
+        # Futures toggle
+        ctk.CTkCheckBox(
+            parent,
+            text="Download Futures  (auto-detects expiry, saves NIFTY_FUTURES_xxx/)",
+            variable=self.var_futures, font=ctk.CTkFont(size=12),
+        ).grid(row=11, column=0, columnspan=2, padx=24, pady=(4, 4), sticky="w")
+
         # VIX toggle
         ctk.CTkCheckBox(
             parent,
-            text="Download India VIX  (saved to INDIAVIX_1MIN / INDIAVIX_1SEC folder)",
+            text="Download India VIX  (saved to INDVIX_1MIN / INDVIX_1SEC folder)",
             variable=self.var_vix, font=ctk.CTkFont(size=12),
-        ).grid(row=11, column=0, columnspan=2, padx=24, pady=(4, 16), sticky="w")
+        ).grid(row=12, column=0, columnspan=2, padx=24, pady=(4, 16), sticky="w")
 
     # ── Download Tab ──────────────────────────────────────────────────────────
 
@@ -502,6 +512,7 @@ class BreezeDownloaderApp(ctk.CTk):
             "max_workers":          int(self.var_workers.get()),
             "calls_per_minute":     float(self.var_cpm.get()),
             "download_spot":        bool(self.var_spot.get()),
+            "download_futures":     bool(self.var_futures.get()),
             "download_vix":         bool(self.var_vix.get()),
             "chunk_minutes":        int(self.var_chunk_min.get()),
         }
