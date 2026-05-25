@@ -628,18 +628,36 @@ class BreezeDownloader:
 
             if not pending: return total
 
-            n_tasks  = len(pending) * len(chunks)
-            workers  = min(self.config.get("max_workers",20) * 10, 1000)
-            self.log(f"      🚀 Flat pool: {len(pending)} files × {len(chunks)} chunks = {n_tasks} tasks")
+            n_tasks = len(pending) * len(chunks)
+            # Pool size = calls_per_minute / 4
+            # This ensures the rate limiter is the bottleneck, not the server.
+            # e.g. 300 calls/min → 75 threads max → server never gets burst-flooded
+            cpm     = self.config.get("calls_per_minute", 90)
+            workers = max(10, min(int(cpm / 4), 200))
+            self.log(f"      🚀 Flat pool: {len(pending)} files × {len(chunks)} chunks "
+                     f"= {n_tasks} tasks | pool={workers} (capped at CPM/4)")
             chunk_results = {sr: [None]*len(chunks) for sr in pending}
             done_count    = [0]
             lock          = threading.Lock()
+
+            def fetch_with_retry(cs, ce, s, r, expiry, max_retry=2):
+                """Fetch one chunk with retry on empty response."""
+                for attempt in range(max_retry + 1):
+                    if self.stop_event.is_set():
+                        raise InterruptedError("Stopped")
+                    rows = self._download_single_chunk(cs, ce, s, r, expiry)
+                    if rows:
+                        return rows
+                    if attempt < max_retry:
+                        # Brief pause before retry — let rate limiter settle
+                        self.stop_event.wait(timeout=1.0)
+                return []
 
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 futures = {}
                 for (s,r) in pending:
                     for ci,(cs,ce) in enumerate(chunks):
-                        fut = ex.submit(self._download_single_chunk, cs, ce, s, r, expiry)
+                        fut = ex.submit(fetch_with_retry, cs, ce, s, r, expiry)
                         futures[fut] = (s,r,ci)
                 for fut in as_completed(futures):
                     if self.stop_event.is_set(): break
@@ -651,7 +669,8 @@ class BreezeDownloader:
                         done_count[0] += 1
                         if done_count[0] % 200 == 0:
                             with self._print_lock:
-                                self.log(f"      ⏳ {done_count[0]}/{n_tasks} chunks | API: {self.rate_limiter.calls}")
+                                self.log(f"      ⏳ {done_count[0]}/{n_tasks} chunks | "
+                                         f"API: {self.rate_limiter.calls}")
 
             for (s,r),(key,out_csv) in pending.items():
                 all_rows = []
