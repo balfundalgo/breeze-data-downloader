@@ -418,7 +418,7 @@ class BreezeDownloader:
                 r = self._safe_call("get_historical_data_v2",
                     interval=interval,
                     from_date=self._iso_z(open_), to_date=self._iso_z(close_),
-                    stock_code=self.config["instrument"], exchange_code="NFO",
+                    stock_code=self._spot_code(), exchange_code="NFO",
                     product_type="futures", expiry_date=exp_s,
                     right="others", strike_price="0",
                 )
@@ -452,7 +452,7 @@ class BreezeDownloader:
                 r = self._safe_call("get_historical_data_v2",
                     interval="1minute",
                     from_date=self._iso_z(open_), to_date=self._iso_z(probe_to),
-                    stock_code=self.config["instrument"], exchange_code="NFO",
+                    stock_code=self._spot_code(), exchange_code="NFO",
                     product_type="options", expiry_date=exp_s,
                     right="call", strike_price=str(atm),
                 )
@@ -471,7 +471,7 @@ class BreezeDownloader:
                 interval="1minute",
                 from_date=self._iso_z(open_),
                 to_date=self._iso_z(open_ + timedelta(minutes=30)),
-                stock_code=self.config["instrument"], exchange_code="NFO",
+                stock_code=self._spot_code(), exchange_code="NFO",
                 product_type="options", expiry_date=exp_s,
                 right="call", strike_price=str(strike),
             )
@@ -530,7 +530,7 @@ class BreezeDownloader:
             r = self._safe_call("get_historical_data_v2",
                 interval="1second",
                 from_date=self._iso_z(chunk_start), to_date=self._iso_z(chunk_end),
-                stock_code=self.config["instrument"], exchange_code="NFO",
+                stock_code=self._spot_code(), exchange_code="NFO",
                 product_type="options", expiry_date=exp_s,
                 right=right, strike_price=str(strike),
             )
@@ -555,7 +555,7 @@ class BreezeDownloader:
             r = self._safe_call("get_historical_data_v2",
                 interval=self.config["interval"],
                 from_date=self._iso_z(open_), to_date=self._iso_z(close_),
-                stock_code=self.config["instrument"], exchange_code="NFO",
+                stock_code=self._spot_code(), exchange_code="NFO",
                 product_type="options", expiry_date=exp_s,
                 right=right, strike_price=str(strike),
             )
