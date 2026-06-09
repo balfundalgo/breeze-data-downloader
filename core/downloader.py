@@ -146,7 +146,10 @@ class BreezeDownloader:
 
     MARKET_OPEN  = (9,  15)
     MARKET_CLOSE = (15, 30)
-    STRIKE_STEP  = 50
+    STRIKE_STEP  = {
+        "NIFTY":     50,
+        "BANKNIFTY": 100,
+    }
     VIX_STOCK_CODE = "INDVIX"
 
     # Breeze stock_code for futures — BANKNIFTY uses CNXBAN not BANKNIFTY
@@ -170,6 +173,10 @@ class BreezeDownloader:
         """Return correct Breeze stock_code for spot/cash (BANKNIFTY→CNXBAN)."""
         return self.SPOT_CODE.get(self.config["instrument"],
                                   self.config["instrument"])
+
+    def _strike_step(self) -> int:
+        """Return strike step: 50 for NIFTY, 100 for BANKNIFTY."""
+        return self.STRIKE_STEP.get(self.config["instrument"], 50)
 
     def __init__(self, config, log_fn, stats_fn, stop_event):
         self.config     = config
@@ -342,13 +349,31 @@ class BreezeDownloader:
     # ── Futures expiry detection ─────────────────────────────────
 
     def _candidate_expiries(self, d: date) -> list[date]:
-        """All weekdays within next 8 weeks — catches any NSE rule."""
+        """
+        Generate candidate expiry dates = last weekday of each month
+        for the next 4 months. This correctly targets monthly expiries
+        (last Thu/Tue/Wed) rather than probing every single weekday.
+        Sorted nearest-first so the right expiry is found quickly.
+        """
         candidates = set()
-        for delta in range(56):
-            c = d + timedelta(days=delta)
-            if c.weekday() < 5:
-                candidates.add(c)
+        for delta_mo in range(5):  # current + next 4 months
+            mo = (d.month - 1 + delta_mo) % 12 + 1
+            yr = d.year + ((d.month - 1 + delta_mo) // 12)
+            for wd in range(5):   # Mon=0 .. Fri=4
+                exp = self._last_weekday_of_month(yr, mo, wd)
+                if exp >= d:
+                    candidates.add(exp)
         return sorted(candidates)
+
+    def _last_weekday_of_month(self, yr: int, mo: int, wd: int) -> date:
+        """Return last occurrence of weekday wd in given month."""
+        if mo == 12:
+            last = date(yr + 1, 1, 1) - timedelta(days=1)
+        else:
+            last = date(yr, mo + 1, 1) - timedelta(days=1)
+        while last.weekday() != wd:
+            last -= timedelta(days=1)
+        return last
 
     def _pick_futures_expiry(self, d: date, instrument: str) -> date | None:
         """
@@ -486,7 +511,7 @@ class BreezeDownloader:
             return cached
         self.log(f"    🔍 Discovering strikes for {expiry}...")
         disc  = self.config.get("strike_discovery_range", 3000)
-        step  = self.STRIKE_STEP
+        step  = self._strike_step()
         avail = set()
 
         def scan(start, stop, direction):
@@ -821,7 +846,7 @@ class BreezeDownloader:
                                    api_calls=self.rate_limiter.calls)
                 continue
 
-            atm    = self._round_step(spot_close, self.STRIKE_STEP)
+            atm    = self._round_step(spot_close, self._strike_step())
             expiry = self._pick_options_expiry(d, atm)
             if not expiry:
                 self.log("   ⏭️  Could not find options expiry — skipping")
