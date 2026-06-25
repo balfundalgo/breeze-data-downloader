@@ -206,6 +206,25 @@ class BreezeDownloader:
             self.log(f"❌ Connection failed: {e}")
             return False
 
+    def reconnect(self) -> bool:
+        """
+        Recreate the BreezeConnect session to clear leaked SDK connections.
+        The breeze-connect SDK leaks socket connections over time, making
+        every call progressively slower. Recreating the session periodically
+        (every N days) resets this and keeps speed constant.
+        """
+        try:
+            self.log("    🔄 Refreshing session (clears connection leak)...")
+            self.breeze = BreezeConnect(api_key=self.config["api_key"])
+            self.breeze.generate_session(
+                api_secret=self.config["api_secret"],
+                session_token=self.config["api_session"],
+            )
+            return True
+        except Exception as e:
+            self.log(f"    ⚠️ Reconnect failed: {e}")
+            return False
+
     # ── Helpers ─────────────────────────────────────────────────
 
     def _iso_z(self, dt: datetime) -> str:
@@ -505,46 +524,25 @@ class BreezeDownloader:
         except Exception: return False
 
     def _discover_strikes(self, d: date, expiry: date, atm: int) -> list[int]:
-        cached = self.strikes_cache.get(expiry)
-        if cached:
-            self.log(f"    📂 Cached strikes for {expiry}: {len(cached)} strikes")
-            return cached
-        self.log(f"    🔍 Discovering strikes for {expiry}...")
-        disc  = self.config.get("strike_discovery_range", 3000)
-        step  = self._strike_step()
-        avail = set()
+        """
+        Generate strikes mathematically — NO probing.
 
-        def scan(start, stop, direction):
-            bound = start
-            for s in range(start, stop, direction * step * 5):
-                if self.stop_event.is_set(): return bound
-                if self._probe_strike(d, expiry, s):
-                    bound = s; avail.add(s)
-                else:
-                    for s2 in range(s + direction*step, s + direction*step*10, direction*step):
-                        if (direction > 0 and s2 > atm+disc) or (direction < 0 and s2 < atm-disc): break
-                        if self._probe_strike(d, expiry, s2):
-                            bound = s2; avail.add(s2); break
-                    else: break
-            return bound
+        Old approach probed ~97 strikes one-by-one per day (37-106s) and
+        leaked SDK connections, causing the downloader to slow to a crawl
+        and appear stuck after a day or two.
 
-        upper = scan(atm, atm+disc+1, +1)
-        lower = scan(atm, atm-disc-1, -1)
-        self.log(f"    📏 Bounds: {lower} – {upper}")
-        all_s = list(range(lower, upper+1, step))
-        with ThreadPoolExecutor(max_workers=min(self.config.get("max_workers",20), 20)) as ex:
-            futures = {ex.submit(self._probe_strike, d, expiry, s): s for s in all_s if s not in avail}
-            for fut in as_completed(futures):
-                if self.stop_event.is_set(): break
-                s = futures[fut]
-                try:
-                    if fut.result(): avail.add(s)
-                except Exception: pass
-        result = sorted(avail)
-        if result:
-            self.log(f"    ✅ Found {len(result)} strikes: {result[0]} – {result[-1]}")
-            self.strikes_cache.set(expiry, result)
-        return result
+        New approach: generate ATM ± discovery_range at the correct step.
+        Strikes that don't exist simply return empty during download —
+        harmless, and the empty-chunk handling already covers it.
+        Result: ~0.5s vs 37-106s, and zero discovery API calls.
+        """
+        disc = self.config.get("strike_discovery_range", 3000)
+        step = self._strike_step()
+        strikes = list(range(atm - disc, atm + disc + 1, step))
+        strikes = [s for s in strikes if s > 0]
+        self.log(f"    ⚡ Generated {len(strikes)} strikes instantly "
+                 f"({strikes[0]} – {strikes[-1]}, step {step}) — no probing")
+        return strikes
 
     # ── Options: single strike/right (1sec flat pool chunk) ──────
 
@@ -758,6 +756,8 @@ class BreezeDownloader:
         self.log("─" * 60)
 
         totals = {"days":0,"files":0,"skipped":0,"rows":0}
+        days_processed = 0   # for periodic session refresh
+        RECONNECT_EVERY = 15  # refresh session every 15 trading days
 
         for d in self._daterange(from_d, to_d):
             if self.stop_event.is_set():
@@ -770,6 +770,11 @@ class BreezeDownloader:
             if spot_df is None or spot_df.empty:
                 self.log("   ⏭️  No spot data (holiday / weekend)")
                 continue
+
+            # Periodic session refresh to clear SDK connection leak
+            days_processed += 1
+            if days_processed % RECONNECT_EVERY == 0:
+                self.reconnect()
 
             spot_close = self._get_spot_close(spot_df)
             if not spot_close or spot_close <= 0:
