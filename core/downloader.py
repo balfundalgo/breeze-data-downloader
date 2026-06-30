@@ -663,8 +663,13 @@ class BreezeDownloader:
             done_count    = [0]
             lock          = threading.Lock()
 
-            def fetch_with_retry(cs, ce, s, r, expiry, max_retry=2):
-                """Fetch one chunk with retry on empty response."""
+            def fetch_with_retry(cs, ce, s, r, expiry, max_retry=1):
+                """
+                Fetch one chunk with retry on empty response.
+                max_retry=1: one retry catches genuine rate-drops without
+                the long cascade that happens when Breeze throttles under
+                sustained load near the end of a large day.
+                """
                 for attempt in range(max_retry + 1):
                     if self.stop_event.is_set():
                         raise InterruptedError("Stopped")
@@ -672,8 +677,7 @@ class BreezeDownloader:
                     if rows:
                         return rows
                     if attempt < max_retry:
-                        # Brief pause before retry — let rate limiter settle
-                        self.stop_event.wait(timeout=1.0)
+                        self.stop_event.wait(timeout=0.5)
                 return []
 
             with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -714,12 +718,21 @@ class BreezeDownloader:
 
     def _is_file_complete(self, csv_path: str, d: date) -> bool:
         try:
-            df = pd.read_csv(csv_path, nrows=5)
-            if "datetime" not in df.columns or df.empty: return False
-            first_ts = pd.to_datetime(df["datetime"].iloc[0])
+            # Fast guard: zero-byte or tiny files (interrupted writes) → incomplete
+            size = os.path.getsize(csv_path)
+            if size < 50:   # header alone is ~40 bytes; real data is much larger
+                return False
+            df = pd.read_csv(csv_path, nrows=5, on_bad_lines="skip",
+                             engine="c", encoding_errors="ignore")
+            if "datetime" not in df.columns or df.empty:
+                return False
+            first_ts = pd.to_datetime(df["datetime"].iloc[0], errors="coerce")
+            if pd.isna(first_ts):
+                return False
             expected = datetime(d.year, d.month, d.day, *self.MARKET_OPEN, 0)
             return first_ts <= pd.Timestamp(expected) + pd.Timedelta(minutes=5)
-        except Exception: return False
+        except Exception:
+            return False
 
     # ── Main run ─────────────────────────────────────────────────
 
