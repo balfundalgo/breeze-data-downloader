@@ -367,21 +367,64 @@ class BreezeDownloader:
 
     # ── Futures expiry detection ─────────────────────────────────
 
+    # NSE NIFTY weekly-expiry day changed Thursday → Tuesday on 2025-09-01.
+    # Last Thursday weekly:  2025-08-28.  First Tuesday weekly: 2025-09-02.
+    EXPIRY_SWITCH_DATE = date(2025, 9, 1)
+    LAST_THU_WEEKLY    = date(2025, 8, 28)   # final Thursday-rule weekly
+
+    def _weekly_expiry_weekday(self, week_monday: date) -> int:
+        """
+        NIFTY weekly expiry weekday for the week beginning `week_monday`:
+          weeks whose expiry falls on/before 2025-08-28 → Thursday (3)
+          weeks from 2025-09-01 onward                  → Tuesday  (1)
+        Decision is based on where the *expiry* would land, so the
+        transition week (late Aug 2025) correctly rolls to Tuesday Sep 2.
+        """
+        # tentative Thursday expiry for this week
+        thu = week_monday + timedelta(days=(3 - week_monday.weekday()) % 7)
+        return 3 if thu <= self.LAST_THU_WEEKLY else 1
+
     def _candidate_expiries(self, d: date) -> list[date]:
         """
-        Generate candidate expiry dates = last weekday of each month
-        for the next 4 months. This correctly targets monthly expiries
-        (last Thu/Tue/Wed) rather than probing every single weekday.
-        Sorted nearest-first so the right expiry is found quickly.
+        Generate candidate expiry dates covering BOTH weekly and monthly
+        NIFTY expiries.
+
+        NIFTY has a weekly expiry EVERY week (Thursday through
+        2025-08-28, Tuesday from 2025-09-02). The monthly is just the
+        last weekly of the month, so generating all weeklies includes
+        monthlies automatically.
+
+        The old version generated only last-weekday-of-month (monthlies),
+        which is why every weekly-expiry folder was missing. This walks
+        week-by-week from d, emitting the correct weekly-expiry weekday
+        per week and handling the Thu→Tue switch (including the transition
+        week, where the last Thursday weekly is 2025-08-28 and the next
+        weekly is Tuesday 2025-09-02 — no phantom Sep-04 Thursday).
+
+        Sorted nearest-first.
         """
         candidates = set()
-        for delta_mo in range(5):  # current + next 4 months
+
+        # Walk forward ~11 weeks from the Monday of d's week.
+        week_monday = d - timedelta(days=d.weekday())
+        for _ in range(12):
+            wd = self._weekly_expiry_weekday(week_monday)
+            exp = week_monday + timedelta(days=(wd - week_monday.weekday()) % 7)
+            if exp >= d:
+                candidates.add(exp)
+            week_monday += timedelta(days=7)
+
+        # Safety net: explicit monthlies (last weekly-weekday) for the
+        # current + next 3 months.
+        for delta_mo in range(4):
             mo = (d.month - 1 + delta_mo) % 12 + 1
             yr = d.year + ((d.month - 1 + delta_mo) // 12)
-            for wd in range(5):   # Mon=0 .. Fri=4
-                exp = self._last_weekday_of_month(yr, mo, wd)
-                if exp >= d:
-                    candidates.add(exp)
+            probe_monday = date(yr, mo, 28) - timedelta(days=date(yr, mo, 28).weekday())
+            wd = self._weekly_expiry_weekday(probe_monday)
+            exp = self._last_weekday_of_month(yr, mo, wd)
+            if exp >= d:
+                candidates.add(exp)
+
         return sorted(candidates)
 
     def _last_weekday_of_month(self, yr: int, mo: int, wd: int) -> date:
@@ -482,15 +525,30 @@ class BreezeDownloader:
     # ── Options expiry detection ─────────────────────────────────
 
     def _pick_options_expiry(self, d: date, atm: int) -> date | None:
+        """
+        Find the ACTIVE (nearest) expiry for date d by probing the API.
+
+        For an intraday straddle, the active expiry is the nearest one
+        that still has data — i.e. the current weekly (or the monthly in
+        monthly-expiry week). Candidates are now sorted strictly
+        nearest-first (smallest days-ahead), so the first one that
+        returns data is the correct active expiry.
+
+        An expiry that has already passed relative to d won't return
+        data for d, so it's naturally skipped. On expiry day itself the
+        same-day expiry is nearest and correct.
+        """
         open_, _ = self._day_bounds(d)
         probe_to  = open_ + timedelta(minutes=30)
-        WEEKDAY_PRIORITY = {1: 0, 0: 1, 2: 2, 4: 3, 3: 4}
+        # strictly nearest-first
         candidates = sorted(
-            self._candidate_expiries(d)[:10],
-            key=lambda x: (x - d).days * 10 + WEEKDAY_PRIORITY.get(x.weekday(), 5)
+            self._candidate_expiries(d)[:12],
+            key=lambda x: (x - d).days
         )
         for expiry in candidates:
             if self.stop_event.is_set(): return None
+            if expiry < d:
+                continue
             exp_s = self._iso_z(datetime(expiry.year, expiry.month, expiry.day, 7, 0, 0))
             try:
                 r = self._safe_call("get_historical_data_v2",
