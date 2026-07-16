@@ -372,6 +372,35 @@ class BreezeDownloader:
     EXPIRY_SWITCH_DATE = date(2025, 9, 1)
     LAST_THU_WEEKLY    = date(2025, 8, 28)   # final Thursday-rule weekly
 
+    # NSE trading holidays (equity/F&O). If an expiry lands on one of these,
+    # NSE shifts the expiry to the PREVIOUS trading day. Extend yearly.
+    NSE_HOLIDAYS = {
+        # 2025
+        date(2025, 2, 26), date(2025, 3, 14), date(2025, 3, 31),
+        date(2025, 4, 10), date(2025, 4, 14), date(2025, 4, 18),
+        date(2025, 5, 1),  date(2025, 8, 15), date(2025, 8, 27),
+        date(2025, 10, 2), date(2025, 10, 20), date(2025, 10, 21),
+        date(2025, 10, 22), date(2025, 11, 5), date(2025, 12, 25),
+        # 2026
+        date(2026, 1, 26), date(2026, 2, 15), date(2026, 3, 3),
+        date(2026, 3, 21), date(2026, 3, 31), date(2026, 4, 3),
+        date(2026, 4, 6),  date(2026, 4, 14), date(2026, 5, 1),
+        date(2026, 5, 12), date(2026, 6, 7),  date(2026, 7, 6),
+        date(2026, 8, 15), date(2026, 9, 14), date(2026, 10, 2),
+        date(2026, 10, 20), date(2026, 11, 5), date(2026, 12, 25),
+    }
+
+    def _shift_if_holiday(self, exp: date) -> date:
+        """
+        If an expiry date falls on an NSE holiday (or weekend), shift it
+        to the previous trading day — this is the NSE rule for expiries
+        landing on holidays. Walks back until a trading day is found.
+        """
+        d = exp
+        while d.weekday() >= 5 or d in self.NSE_HOLIDAYS:
+            d -= timedelta(days=1)
+        return d
+
     def _weekly_expiry_weekday(self, week_monday: date) -> int:
         """
         NIFTY weekly expiry weekday for the week beginning `week_monday`:
@@ -387,43 +416,48 @@ class BreezeDownloader:
     def _candidate_expiries(self, d: date) -> list[date]:
         """
         Generate candidate expiry dates covering BOTH weekly and monthly
-        NIFTY expiries.
+        NIFTY expiries, with holiday-shift awareness.
 
         NIFTY has a weekly expiry EVERY week (Thursday through
         2025-08-28, Tuesday from 2025-09-02). The monthly is just the
         last weekly of the month, so generating all weeklies includes
         monthlies automatically.
 
-        The old version generated only last-weekday-of-month (monthlies),
-        which is why every weekly-expiry folder was missing. This walks
-        week-by-week from d, emitting the correct weekly-expiry weekday
-        per week and handling the Thu→Tue switch (including the transition
-        week, where the last Thursday weekly is 2025-08-28 and the next
-        weekly is Tuesday 2025-09-02 — no phantom Sep-04 Thursday).
+        If a computed expiry lands on an NSE holiday, NSE shifts it to
+        the previous trading day. We emit BOTH the nominal and the
+        holiday-shifted date as candidates so the API probe finds the
+        real one. (Earlier versions generated only the nominal weekday,
+        so holiday-shifted expiries like 2025-04-09, 2025-04-30,
+        2025-10-17 were missed entirely and those days' data got
+        misfiled under the next week's expiry.)
 
         Sorted nearest-first.
         """
         candidates = set()
 
-        # Walk forward ~11 weeks from the Monday of d's week.
+        # Walk forward ~12 weeks from the Monday of d's week.
         week_monday = d - timedelta(days=d.weekday())
-        for _ in range(12):
+        for _ in range(13):
             wd = self._weekly_expiry_weekday(week_monday)
             exp = week_monday + timedelta(days=(wd - week_monday.weekday()) % 7)
-            if exp >= d:
-                candidates.add(exp)
+            shifted = self._shift_if_holiday(exp)
+            for e in (exp, shifted):
+                if e >= d:
+                    candidates.add(e)
             week_monday += timedelta(days=7)
 
         # Safety net: explicit monthlies (last weekly-weekday) for the
-        # current + next 3 months.
+        # current + next 3 months, holiday-shifted.
         for delta_mo in range(4):
             mo = (d.month - 1 + delta_mo) % 12 + 1
             yr = d.year + ((d.month - 1 + delta_mo) // 12)
             probe_monday = date(yr, mo, 28) - timedelta(days=date(yr, mo, 28).weekday())
             wd = self._weekly_expiry_weekday(probe_monday)
             exp = self._last_weekday_of_month(yr, mo, wd)
-            if exp >= d:
-                candidates.add(exp)
+            shifted = self._shift_if_holiday(exp)
+            for e in (exp, shifted):
+                if e >= d:
+                    candidates.add(e)
 
         return sorted(candidates)
 
