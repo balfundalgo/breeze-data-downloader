@@ -81,6 +81,9 @@ class BreezeDownloaderApp(ctk.CTk):
             "download_spot":     bool(self.var_spot.get()),
             "download_futures":  bool(self.var_futures.get()),
             "download_vix":      bool(self.var_vix.get()),
+            "expiry_near":       bool(self.var_exp_near.get()),
+            "expiry_next":       bool(self.var_exp_next.get()),
+            "expiry_far":        bool(self.var_exp_far.get()),
             "chunk_minutes":     int(self.var_chunk_min.get()),
         }
         with open(CONFIG_FILE, "w") as f:
@@ -102,6 +105,9 @@ class BreezeDownloaderApp(ctk.CTk):
         if "download_spot"    in c: self.var_spot.set(c["download_spot"])
         if "download_futures" in c: self.var_futures.set(c["download_futures"])
         if "download_vix"     in c: self.var_vix.set(c["download_vix"])
+        if "expiry_near"      in c: self.var_exp_near.set(c["expiry_near"])
+        if "expiry_next"      in c: self.var_exp_next.set(c["expiry_next"])
+        if "expiry_far"       in c: self.var_exp_far.set(c["expiry_far"])
         if "chunk_minutes"    in c: self.var_chunk_min.set(c["chunk_minutes"])
         # Trigger chunk visibility
         self._on_interval_change(self.var_interval.get())
@@ -227,6 +233,9 @@ class BreezeDownloaderApp(ctk.CTk):
         self.var_spot        = ctk.BooleanVar(value=True)
         self.var_futures     = ctk.BooleanVar(value=False)
         self.var_vix         = ctk.BooleanVar(value=False)
+        self.var_exp_near    = ctk.BooleanVar(value=True)   # near expiry (default)
+        self.var_exp_next    = ctk.BooleanVar(value=False)  # next expiry
+        self.var_exp_far     = ctk.BooleanVar(value=False)  # far expiry
         self.var_chunk_min   = ctk.DoubleVar(value=15)
 
         def lbl(text, row, col=0, **kw):
@@ -331,7 +340,38 @@ class BreezeDownloaderApp(ctk.CTk):
             parent,
             text="Download India VIX  (saved to INDVIX_1MIN / INDVIX_1SEC folder)",
             variable=self.var_vix, font=ctk.CTkFont(size=12),
-        ).grid(row=12, column=0, columnspan=2, padx=24, pady=(4, 16), sticky="w")
+        ).grid(row=12, column=0, columnspan=2, padx=24, pady=(4, 8), sticky="w")
+
+        # ── Expiry selection (near / next / far) ──────────────────────────
+        ctk.CTkLabel(
+            parent, text="Option expiries to download:",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).grid(row=13, column=0, columnspan=2, padx=24, pady=(8, 2), sticky="w")
+
+        exp_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        exp_frame.grid(row=14, column=0, columnspan=2, padx=24, pady=(0, 4), sticky="w")
+
+        ctk.CTkCheckBox(
+            exp_frame, text="Near (nearest active)",
+            variable=self.var_exp_near, font=ctk.CTkFont(size=12),
+        ).grid(row=0, column=0, padx=(0, 18), pady=2, sticky="w")
+        ctk.CTkCheckBox(
+            exp_frame, text="Next (2nd upcoming)",
+            variable=self.var_exp_next, font=ctk.CTkFont(size=12),
+        ).grid(row=0, column=1, padx=(0, 18), pady=2, sticky="w")
+        ctk.CTkCheckBox(
+            exp_frame, text="Far (3rd upcoming)",
+            variable=self.var_exp_far, font=ctk.CTkFont(size=12),
+        ).grid(row=0, column=2, padx=(0, 0), pady=2, sticky="w")
+
+        ctk.CTkLabel(
+            parent,
+            text=("NIFTY: near/next/far = this/next/following weekly.   "
+                  "BANKNIFTY: this/next/following monthly.\n"
+                  "Selecting Next/Far multiplies download size & time. "
+                  "Each expiry is saved to its own folder."),
+            font=ctk.CTkFont(size=10), text_color="#8899aa", justify="left",
+        ).grid(row=15, column=0, columnspan=2, padx=24, pady=(0, 16), sticky="w")
 
     # ── Download Tab ──────────────────────────────────────────────────────────
 
@@ -550,6 +590,10 @@ class BreezeDownloaderApp(ctk.CTk):
 
     def _build_config(self) -> dict:
         """Build config dict from current GUI state."""
+        # Safety: if no expiry slot ticked, default to near (avoid empty run)
+        if not (self.var_exp_near.get() or self.var_exp_next.get()
+                or self.var_exp_far.get()):
+            self.var_exp_near.set(True)
         return {
             "api_key":              self.var_api_key.get().strip(),
             "api_secret":           self.var_api_secret.get().strip(),
@@ -565,6 +609,9 @@ class BreezeDownloaderApp(ctk.CTk):
             "download_spot":        bool(self.var_spot.get()),
             "download_futures":     bool(self.var_futures.get()),
             "download_vix":         bool(self.var_vix.get()),
+            "expiry_near":          bool(self.var_exp_near.get()),
+            "expiry_next":          bool(self.var_exp_next.get()),
+            "expiry_far":           bool(self.var_exp_far.get()),
             "chunk_minutes":        int(self.var_chunk_min.get()),
         }
     def _stop_download(self):

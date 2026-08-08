@@ -560,28 +560,53 @@ class BreezeDownloader:
 
     def _pick_options_expiry(self, d: date, atm: int) -> date | None:
         """
-        Find the ACTIVE (nearest) expiry for date d by probing the API.
+        Find the ACTIVE (nearest) expiry for date d.
+        Kept for backward compatibility; returns just the near expiry.
+        """
+        picks = self._pick_expiries(d, atm, want_near=True,
+                                    want_next=False, want_far=False)
+        return picks[0] if picks else None
 
-        For an intraday straddle, the active expiry is the nearest one
-        that still has data — i.e. the current weekly (or the monthly in
-        monthly-expiry week). Candidates are now sorted strictly
-        nearest-first (smallest days-ahead), so the first one that
-        returns data is the correct active expiry.
+    def _pick_expiries(self, d: date, atm: int,
+                       want_near=True, want_next=False, want_far=False) -> list:
+        """
+        Return the requested upcoming real expiries for date d:
+          near = 1st upcoming expiry that has data
+          next = 2nd upcoming
+          far  = 3rd upcoming
 
-        An expiry that has already passed relative to d won't return
-        data for d, so it's naturally skipped. On expiry day itself the
-        same-day expiry is nearest and correct.
+        Uses _candidate_expiries (which already handles the Thu->Tue
+        switch, holiday shifts, weekends, and monthly/weekly logic), then
+        probes each candidate in nearest-first order via the API. Only
+        expiries Breeze actually returns data for are collected, so the
+        result is ground-truth-correct — a candidate that doesn't exist
+        (e.g. a holiday-shifted-away date) simply returns nothing and is
+        skipped. Works for both NIFTY (weekly chain) and BANKNIFTY
+        (monthly chain) with no special-casing.
+
+        Returns a list in [near, next, far] order containing only the
+        slots requested and only those that actually have data.
         """
         open_, _ = self._day_bounds(d)
         probe_to  = open_ + timedelta(minutes=30)
-        # strictly nearest-first
+
+        n_needed = 0
+        if want_near: n_needed = 1
+        if want_next: n_needed = 2
+        if want_far:  n_needed = 3
+        if n_needed == 0:
+            return []
+
         candidates = sorted(
-            self._candidate_expiries(d)[:12],
+            self._candidate_expiries(d)[:16],
             key=lambda x: (x - d).days
         )
+
+        found = []
         for expiry in candidates:
-            if self.stop_event.is_set(): return None
-            if expiry < d:
+            if self.stop_event.is_set():
+                break
+            if expiry < d or expiry in found:
                 continue
             exp_s = self._iso_z(datetime(expiry.year, expiry.month, expiry.day, 7, 0, 0))
             try:
@@ -592,10 +617,20 @@ class BreezeDownloader:
                     product_type="options", expiry_date=exp_s,
                     right="call", strike_price=str(atm),
                 )
-                if r.get("Success"): return expiry
-            except InterruptedError: raise
-            except Exception: continue
-        return None
+                if r.get("Success"):
+                    found.append(expiry)
+                    if len(found) >= n_needed:
+                        break
+            except InterruptedError:
+                raise
+            except Exception:
+                continue
+
+        slots = []
+        for i, want in enumerate([want_near, want_next, want_far]):
+            if want and i < len(found):
+                slots.append(found[i])
+        return slots
 
     # ── Strike discovery ─────────────────────────────────────────
 
@@ -956,34 +991,59 @@ class BreezeDownloader:
                                    api_calls=self.rate_limiter.calls)
                 continue
 
-            atm    = self._round_step(spot_close, self._strike_step())
-            expiry = self._pick_options_expiry(d, atm)
-            if not expiry:
+            atm = self._round_step(spot_close, self._strike_step())
+
+            # Which expiry slots to download (default: near only)
+            want_near = cfg.get("expiry_near", True)
+            want_next = cfg.get("expiry_next", False)
+            want_far  = cfg.get("expiry_far",  False)
+
+            expiries = self._pick_expiries(d, atm,
+                                           want_near=want_near,
+                                           want_next=want_next,
+                                           want_far=want_far)
+            if not expiries:
                 self.log("   ⏭️  Could not find options expiry — skipping")
                 continue
 
-            self.log(f"   📍 Spot={spot_close:.2f} | ATM={atm} | Options expiry={expiry}")
+            slot_names = []
+            if want_near: slot_names.append("near")
+            if want_next: slot_names.append("next")
+            if want_far:  slot_names.append("far")
+            picked = ", ".join(f"{slot_names[i]}={expiries[i]}"
+                               for i in range(len(expiries)))
+            self.log(f"   📍 Spot={spot_close:.2f} | ATM={atm} | {picked}")
 
-            strikes = self._discover_strikes(d, expiry, atm)
-            if not strikes:
-                self.log("   ⏭️  No strikes found — skipping")
-                continue
+            day_had_data = False
+            for slot_idx, expiry in enumerate(expiries):
+                if self.stop_event.is_set():
+                    break
+                label = slot_names[slot_idx] if slot_idx < len(slot_names) else f"exp{slot_idx}"
 
-            self.log(f"   📊 Downloading {len(strikes)} strikes × 2 sides…")
-            day_stats = self._process_options_day(d, expiry, strikes, self.progress)
-            totals["days"]    += 1
-            totals["files"]   += day_stats["files"]
-            totals["skipped"] += day_stats["skipped"]
-            totals["rows"]    += day_stats["rows"]
-            self.progress.save()
+                strikes = self._discover_strikes(d, expiry, atm)
+                if not strikes:
+                    self.log(f"      ⏭️  {label} ({expiry}): no strikes — skipping")
+                    continue
 
-            self._update_stats(
-                days=totals["days"], files=totals["files"],
-                rows=totals["rows"], api_calls=self.rate_limiter.calls,
-            )
-            self.log(f"   ✅ {day_stats['files']} new | "
-                     f"{day_stats['skipped']} skipped | "
-                     f"{day_stats['rows']:,} rows | API: {self.rate_limiter.calls}")
+                self.log(f"      📊 {label} expiry {expiry}: "
+                         f"{len(strikes)} strikes × 2 sides…")
+                day_stats = self._process_options_day(d, expiry, strikes, self.progress)
+                totals["files"]   += day_stats["files"]
+                totals["skipped"] += day_stats["skipped"]
+                totals["rows"]    += day_stats["rows"]
+                self.progress.save()
+                day_had_data = True
+
+                self._update_stats(
+                    days=totals["days"], files=totals["files"],
+                    rows=totals["rows"], api_calls=self.rate_limiter.calls,
+                )
+                self.log(f"      ✅ {label}: {day_stats['files']} new | "
+                         f"{day_stats['skipped']} skipped | "
+                         f"{day_stats['rows']:,} rows | API: {self.rate_limiter.calls}")
+
+            if day_had_data:
+                totals["days"] += 1
 
         self.log(f"\n{'='*60}")
         self.log(f"✅ Download complete!")
